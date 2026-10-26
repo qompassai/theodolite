@@ -1,0 +1,39 @@
+{
+  "$schema": "https://static.modelcontextprotocol.io/schemas/2025-12-11/server.schema.json",
+  "name": "ai.qompass/theodolite",
+  "title": "Theodolite",
+  "description": "Headless, deterministic LSP bridge: pinned language-server sessions as bounded MCP tools.",
+  "version": "0.1.0",
+  "websiteUrl": "https://qompass.ai/solutions/theodolite/",
+  "repository": {
+    "url": "https://github.com/qompassai/theodolite",
+    "source": "github"
+  },
+  "packages": [
+    {
+      "registryType": "mcpb",
+      "identifier": "https://github.com/qompassai/theodolite/releases/download/v0.1.0/theodolite-mcp-0.1.0-linux-x64.mcpb",
+      "fileSha256": "93448a7ad8e4d2cb7b32ba766afeb1e5fb7718e5c61908f164e6afc7b3453c0f",
+      "transport": {
+        "type": "stdio"
+      }
+    }
+  ],
+  "_meta": {
+    "io.modelcontextprotocol.registry/publisher-provided": {
+      "ai.qompass/identity": {
+        "publisher": "Qompass AI",
+        "about": "https://qompass.ai/about",
+        "mcpCatalog": "https://qompass.ai/solutions/mcp-servers/",
+        "contact": "mailto:map@qompass.ai",
+        "githubOrganization": "https://github.com/qompassai",
+        "githubMaintainer": "https://github.com/PhaedrusFlow",
+        "gitlabMaintainer": "https://gitlab.com/PhaedrusFlow",
+        "cratesIoMaintainer": "https://crates.io/users/PhaedrusFlow",
+        "huggingFace": "https://huggingface.co/qompass",
+        "orcid": "https://orcid.org/0000-0002-0302-4812",
+        "zenodoCommunity": "https://zenodo.org/communities/qompassai"
+      }
+    }
+  }
+}
