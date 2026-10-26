@@ -1,18 +1,26 @@
-//! WorkspaceEdit shaping and preview rendering (SPEC §6 mutation
-//! class, P5 item 1; the applier half lands with item 3 in this
-//! same module).
+//! WorkspaceEdit shaping, preview rendering, and the single
+//! edit applier (SPEC §6 mutation class, P5 items 1 and 3).
 //!
 //! A server-returned `WorkspaceEdit` is untrusted input: it is
 //! shaped into one canonical form here (per-file edit lists sorted
-//! by (uri, range, new_text), exact duplicates dropped) and
-//! rendered for previews. One hard rule already applies at shaping
-//! time: a `documentChanges` entry carrying a file create / rename
-//! / delete operation is a typed refusal, never silently dropped
-//! and never applied (the bridge edits file *contents* only).
+//! by (uri, range, new_text), exact duplicates dropped), rendered
+//! for previews, and — only through the gated apply tools —
+//! written by the applier in this module, which is the bridge's
+//! ONLY write path. Two hard rules:
+//!
+//! - A `documentChanges` entry carrying a file create / rename /
+//!   delete operation is a typed refusal, never silently dropped
+//!   and never applied (the bridge edits file *contents* only).
+//! - The applier validates everything (workspace boundary, file
+//!   existence, range spans, edit overlap) for every target file
+//!   before writing anything, then writes per file atomically
+//!   (write-temp + rename, original permissions preserved). A
+//!   refused apply writes zero bytes anywhere.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
-use crate::errors::{BridgeError, BridgeResult};
+use crate::errors::{BridgeError, BridgeResult, io_error};
+use crate::session::resolve_within;
 use crate::shaping::{Position, Range, parse_range, relativize_uri, uri_to_path};
 
 /// One text replacement inside one file, in LSP range terms
@@ -192,6 +200,127 @@ fn byte_offset(content: &str, position: Position) -> Option<usize> {
         return Some(line_end);
     }
     None
+}
+
+/// One file's outcome from the applier.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AppliedFile {
+    /// Absolute `file://` URI that was written.
+    pub uri: String,
+    /// How many edits were written into it.
+    pub edits_applied: usize,
+}
+
+/// Apply a shaped edit set — the bridge's ONLY write path (P5
+/// items 3–4). Two phases: phase 1 resolves and validates every
+/// target (workspace boundary, existence, UTF-8 content, span
+/// bounds, overlap) and computes every new content in memory;
+/// phase 2 writes each file atomically. Any refusal happens in
+/// phase 1, so a refused apply writes nothing anywhere.
+pub fn apply_workspace_edit(
+    workspace_root: &Path,
+    files: &[FileEdits],
+) -> BridgeResult<Vec<AppliedFile>> {
+    // Phase 1: compute, writing nothing.
+    let mut planned: Vec<PlannedFile> = Vec::with_capacity(files.len());
+    for file in files {
+        let path = uri_to_path(&file.uri)?;
+        let absolute = resolve_within(workspace_root, &path.to_string_lossy())?;
+        let bytes = std::fs::read(&absolute).map_err(|e| io_error("reading edit target", e))?;
+        let content = String::from_utf8(bytes).map_err(|_| BridgeError::InvalidArgument {
+            detail: format!("edit target {} is not valid UTF-8", file.uri),
+        })?;
+        let permissions = std::fs::metadata(&absolute)
+            .map_err(|e| io_error("stat-ing edit target", e))?
+            .permissions();
+        let new_content = apply_edits_to_content(&content, &file.edits, &file.uri)?;
+        planned.push(PlannedFile {
+            uri: file.uri.clone(),
+            path: absolute,
+            permissions,
+            new_content,
+            edits_applied: file.edits.len(),
+        });
+    }
+    // Phase 2: write each file atomically (temp sibling + rename).
+    let mut applied = Vec::with_capacity(planned.len());
+    for plan in planned {
+        write_atomically(&plan)?;
+        applied.push(AppliedFile {
+            uri: plan.uri,
+            edits_applied: plan.edits_applied,
+        });
+    }
+    Ok(applied)
+}
+
+struct PlannedFile {
+    uri: String,
+    path: PathBuf,
+    permissions: std::fs::Permissions,
+    new_content: String,
+    edits_applied: usize,
+}
+
+fn write_atomically(plan: &PlannedFile) -> BridgeResult<()> {
+    let directory = plan.path.parent().ok_or_else(|| BridgeError::Io {
+        detail: format!("edit target {} has no parent directory", plan.uri),
+    })?;
+    let file_name = plan
+        .path
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    let temp = directory.join(format!(
+        ".{file_name}.theodolite-tmp-{}",
+        std::process::id()
+    ));
+    let outcome = (|| -> BridgeResult<()> {
+        std::fs::write(&temp, plan.new_content.as_bytes())
+            .map_err(|e| io_error("writing edit temp file", e))?;
+        std::fs::set_permissions(&temp, plan.permissions.clone())
+            .map_err(|e| io_error("setting edit temp permissions", e))?;
+        std::fs::rename(&temp, &plan.path).map_err(|e| io_error("renaming edit temp file", e))?;
+        Ok(())
+    })();
+    if outcome.is_err() {
+        let _ = std::fs::remove_file(&temp);
+    }
+    outcome
+}
+
+/// Apply one file's edits to its content, validating spans and
+/// overlap. Edits are applied last-to-first so earlier offsets stay
+/// valid; insertions at one point land in canonical (sorted) order.
+fn apply_edits_to_content(content: &str, edits: &[TextEdit], uri: &str) -> BridgeResult<String> {
+    let mut sorted: Vec<&TextEdit> = edits.iter().collect();
+    sorted.sort_by(|a, b| a.range.cmp(&b.range).then(a.new_text.cmp(&b.new_text)));
+    for pair in sorted.windows(2) {
+        let (a, b) = (pair[0], pair[1]);
+        if a.range.start < b.range.end && b.range.start < a.range.end {
+            return Err(BridgeError::InvalidArgument {
+                detail: format!("overlapping edits for {uri}; the edit set is refused whole"),
+            });
+        }
+    }
+    let mut result = content.to_string();
+    for edit in sorted.iter().rev() {
+        let start =
+            byte_offset(&result, edit.range.start).ok_or_else(|| BridgeError::InvalidArgument {
+                detail: format!("edit start is outside {uri}"),
+            })?;
+        let end =
+            byte_offset(&result, edit.range.end).ok_or_else(|| BridgeError::InvalidArgument {
+                detail: format!("edit end is outside {uri}"),
+            })?;
+        if end < start {
+            return Err(BridgeError::InvalidArgument {
+                detail: format!("edit end precedes its start in {uri}"),
+            });
+        }
+        result.replace_range(start..end, &edit.new_text);
+    }
+    Ok(result)
 }
 
 /// Render a shaped edit set as the canonical preview/apply file

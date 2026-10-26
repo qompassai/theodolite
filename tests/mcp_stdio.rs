@@ -1202,6 +1202,187 @@ fn ambiguous_mutation_config_refuses_to_start() {
     }
 }
 
+const GATED_TOP: &str = "mutation = \"gated\"\nmutation_allowlist = [\"alice\"]";
+
+/// A workspace whose `src/lib.rs` is the fake's code-action edit
+/// target: `pub fn lib_thing() {}` puts bytes 4..6 ("fn") inside
+/// the fixture edit's range.
+fn make_apply_workspace(dir: &Path) -> PathBuf {
+    let root = make_workspace(dir);
+    std::fs::create_dir_all(root.join("src")).expect("mkdir src");
+    std::fs::write(root.join("src/lib.rs"), "pub fn lib_thing() {}\n").expect("write lib.rs");
+    root
+}
+
+fn actions_args(ws: &Path, line: u64) -> serde_json::Value {
+    serde_json::json!({
+        "workspace": ws.to_string_lossy(), "server": "fake", "path": "main.rs",
+        "line": line, "character": 0, "end_line": line, "end_character": 0
+    })
+}
+
+fn listed_handle(result: &serde_json::Value, title: &str) -> String {
+    result["actions"]
+        .as_array()
+        .expect("actions array")
+        .iter()
+        .find(|action| action["title"] == title)
+        .and_then(|action| action["handle"].as_str())
+        .unwrap_or_else(|| panic!("no handle minted for {title:?} in {result}"))
+        .to_string()
+}
+
+fn apply_args(ws: &Path, handle: &str) -> serde_json::Value {
+    serde_json::json!({
+        "workspace": ws.to_string_lossy(), "server": "fake", "handle": handle
+    })
+}
+
+#[test]
+fn code_action_apply_applies_the_listed_edit() {
+    let dir = temp_dir("apply-basic");
+    let ws = make_apply_workspace(&dir);
+    let config = write_fake_config(&dir, "rich", GATED_TOP, &[]);
+    let mut bridge = Bridge::spawn_as(&config, Some("alice"));
+    let (is_error, result) = bridge.call_tool("code_actions", actions_args(&ws, 0));
+    assert!(!is_error, "{result}");
+    // The gated listing mints handles but STILL carries no payload.
+    let text = result.to_string();
+    assert!(!text.contains("PAYLOAD-MARKER-EDIT"), "{text}");
+    assert!(!text.contains("newText"), "{text}");
+    // Command-carrying actions mint no handle.
+    let bare = result["actions"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|action| action["title"] == "Legacy command")
+        .expect("bare command listed");
+    assert!(bare.get("handle").is_none(), "{bare}");
+    let handle = listed_handle(&result, "Fix the thing");
+    assert!(handle.starts_with("act-"), "{handle}");
+    let (is_error, result) = bridge.call_tool("code_action_apply", apply_args(&ws, &handle));
+    assert!(!is_error, "{result}");
+    assert_eq!(result["applied"], true);
+    assert_eq!(result["total_edits"], 1);
+    assert_eq!(result["files"][0]["uri"], "file:///src/lib.rs");
+    assert_eq!(result["files"][0]["edits_applied"], 1);
+    let content = std::fs::read_to_string(ws.join("src/lib.rs")).expect("read applied lib.rs");
+    assert!(content.contains("PAYLOAD-MARKER-EDIT"), "{content}");
+    assert!(content.contains("lib_thing"), "{content}");
+    // The decision is in the transcript, metadata only.
+    let (is_error, status) = bridge.call_tool(
+        "session_status",
+        serde_json::json!({"workspace": ws.to_string_lossy(), "server": "fake"}),
+    );
+    assert!(!is_error, "{status}");
+    let logged = status["gate_decisions"]
+        .as_array()
+        .expect("gate log array")
+        .iter()
+        .any(|entry| entry["tool"] == "code_action_apply" && entry["decision"] == "allow");
+    assert!(logged, "{status}");
+    bridge.shutdown();
+}
+
+#[test]
+fn code_action_apply_refuses_forged_replayed_and_hand_edits() {
+    let dir = temp_dir("apply-forgery");
+    let ws = make_apply_workspace(&dir);
+    let config = write_fake_config(&dir, "rich", GATED_TOP, &[]);
+    let mut bridge = Bridge::spawn_as(&config, Some("alice"));
+    let (_, result) = bridge.call_tool("code_actions", actions_args(&ws, 0));
+    let handle = listed_handle(&result, "Fix the thing");
+    // A forged handle: typed GateDenied, logged.
+    let (is_error, result) = bridge.call_tool("code_action_apply", apply_args(&ws, "act-999"));
+    assert!(is_error);
+    assert_eq!(Bridge::error_code(&result), "GateDenied", "{result}");
+    // A caller-supplied edit riding alongside the real handle:
+    // refused as an argument error before anything is decided.
+    let mut args = apply_args(&ws, &handle);
+    args["edit"] = serde_json::json!({"changes": {}});
+    let (is_error, result) = bridge.call_tool("code_action_apply", args);
+    assert!(is_error);
+    assert_eq!(Bridge::error_code(&result), "InvalidArgument", "{result}");
+    // The real apply succeeds exactly once...
+    let (is_error, result) = bridge.call_tool("code_action_apply", apply_args(&ws, &handle));
+    assert!(!is_error, "{result}");
+    // ...and its replay is a typed GateDenied (single-use).
+    let (is_error, result) = bridge.call_tool("code_action_apply", apply_args(&ws, &handle));
+    assert!(is_error);
+    assert_eq!(Bridge::error_code(&result), "GateDenied", "{result}");
+    let text = result.to_string();
+    assert!(text.contains("single-use"), "{text}");
+    bridge.shutdown();
+}
+
+#[test]
+fn code_action_apply_refuses_a_stale_handle_after_drift() {
+    let dir = temp_dir("apply-stale");
+    let ws = make_apply_workspace(&dir);
+    let config = write_fake_config(&dir, "rich", GATED_TOP, &[]);
+    let mut bridge = Bridge::spawn_as(&config, Some("alice"));
+    let (_, result) = bridge.call_tool("code_actions", actions_args(&ws, 0));
+    let handle = listed_handle(&result, "Fix the thing");
+    // The target changes between listing and apply.
+    std::fs::write(ws.join("src/lib.rs"), "pub fn drifted() {}\n").expect("drift lib.rs");
+    let (is_error, result) = bridge.call_tool("code_action_apply", apply_args(&ws, &handle));
+    assert!(is_error);
+    assert_eq!(Bridge::error_code(&result), "GateDenied", "{result}");
+    let text = result.to_string();
+    assert!(text.contains("changed since"), "{text}");
+    // Nothing was written by the bridge: the file is the drift.
+    let content = std::fs::read_to_string(ws.join("src/lib.rs")).expect("read lib.rs");
+    assert_eq!(content, "pub fn drifted() {}\n");
+    bridge.shutdown();
+}
+
+#[test]
+fn code_action_apply_refuses_escaping_and_overlapping_edit_sets() {
+    let dir = temp_dir("apply-hostile");
+    let ws = make_apply_workspace(&dir);
+    let config = write_fake_config(&dir, "rich", GATED_TOP, &[]);
+    let passwd_before = std::fs::read("/etc/passwd").expect("read /etc/passwd");
+    let mut bridge = Bridge::spawn_as(&config, Some("alice"));
+    // Escaping edit set: refused at the boundary, nothing written.
+    let (_, result) = bridge.call_tool("code_actions", actions_args(&ws, 42));
+    let handle = listed_handle(&result, "Escape fix");
+    let (is_error, result) = bridge.call_tool("code_action_apply", apply_args(&ws, &handle));
+    assert!(is_error);
+    assert_eq!(Bridge::error_code(&result), "WorkspaceEscape", "{result}");
+    assert_eq!(
+        std::fs::read("/etc/passwd").expect("re-read"),
+        passwd_before
+    );
+    // Overlapping edits: refused whole, target untouched.
+    let (_, result) = bridge.call_tool("code_actions", actions_args(&ws, 43));
+    let handle = listed_handle(&result, "Overlap fix");
+    let (is_error, result) = bridge.call_tool("code_action_apply", apply_args(&ws, &handle));
+    assert!(is_error);
+    assert_eq!(Bridge::error_code(&result), "InvalidArgument", "{result}");
+    let content = std::fs::read_to_string(ws.join("src/lib.rs")).expect("read lib.rs");
+    assert_eq!(content, "pub fn lib_thing() {}\n");
+    bridge.shutdown();
+}
+
+#[test]
+fn code_action_handles_are_session_scoped() {
+    let dir = temp_dir("apply-cross-session");
+    let ws_one = make_apply_workspace(&dir.join("one"));
+    let ws_two = make_apply_workspace(&dir.join("two"));
+    let config = write_fake_config(&dir, "rich", GATED_TOP, &[]);
+    let mut bridge = Bridge::spawn_as(&config, Some("alice"));
+    let (_, result) = bridge.call_tool("code_actions", actions_args(&ws_one, 0));
+    let handle = listed_handle(&result, "Fix the thing");
+    // The handle exists only in session one's store; naming
+    // session two's workspace is a typed GateDenied (missing).
+    let (is_error, result) = bridge.call_tool("code_action_apply", apply_args(&ws_two, &handle));
+    assert!(is_error);
+    assert_eq!(Bridge::error_code(&result), "GateDenied", "{result}");
+    let content = std::fs::read_to_string(ws_two.join("src/lib.rs")).expect("read two lib.rs");
+    assert_eq!(content, "pub fn lib_thing() {}\n");
+    bridge.shutdown();
+}
+
 #[test]
 fn rename_preview_writes_nothing_even_for_hostile_edit_sets() {
     let dir = temp_dir("rename-no-writes");

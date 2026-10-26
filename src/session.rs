@@ -84,14 +84,23 @@ pub struct GateLogEntry {
     pub reason: String,
 }
 
+/// The lookup state of one action handle (P5 item 3).
+#[derive(Debug, Clone)]
+pub enum ActionHandleLookup {
+    /// Exists, unused, applicable.
+    Valid(StoredAction),
+    /// Exists, but its single use is spent.
+    Used,
+    /// No such handle in this session.
+    Missing,
+}
+
 /// One minted action handle's stored state (P5 item 3): the shaped
 /// edit set a `code_actions` listing offered, the listing-time
 /// SHA-256 of every target file (`None` where the target did not
 /// exist at listing), and the single-use flag. Handles live and
 /// die with their session; nothing here is ever rendered into a
-/// listing result beyond the opaque id. (The store itself lands
-/// with item 3; the type is defined here because the gate's
-/// vocabulary is incomplete without it.)
+/// listing result beyond the opaque id.
 #[derive(Debug, Clone)]
 pub struct StoredAction {
     /// The shaped edit set to apply.
@@ -134,6 +143,12 @@ struct Inner {
     /// this, never probed by trial request: an unadvertised feature
     /// is a typed `UnsupportedMethod`, not a server error.
     server_capabilities: serde_json::Value,
+    /// Action handles minted by `code_actions` for the gated apply
+    /// (P5 item 3), keyed by their opaque id.
+    action_handles: HashMap<String, StoredAction>,
+    /// Handle id sequence (per session; ids are opaque counters,
+    /// never encodings of the edit they name).
+    next_handle_seq: u64,
     /// Gate decisions recorded for the transcript (P5 item 2):
     /// metadata only — tool, outcome, reason. No edit bodies, no
     /// file contents, ever.
@@ -174,6 +189,8 @@ impl SessionState {
                 last_quiescent_seq: 0,
                 progress_completed: 0,
                 server_capabilities: serde_json::Value::Null,
+                action_handles: HashMap::new(),
+                next_handle_seq: 0,
                 gate_log: Vec::new(),
                 stderr_ring: VecDeque::new(),
                 exit_status: None,
@@ -684,6 +701,49 @@ impl Session {
     /// (`textDocument/diagnostic`, advertised as `diagnosticProvider`).
     pub fn supports_pull_diagnostics(&self) -> bool {
         self.capability_advertised("diagnosticProvider")
+    }
+
+    /// Mint an action handle for one listed code action's shaped
+    /// edit set (P5 item 3). The id is an opaque per-session
+    /// counter; the edit set and its listing-time file hashes stay
+    /// server-side and are never rendered into the listing.
+    pub fn mint_action_handle(
+        &self,
+        edits: Vec<FileEdits>,
+        file_hashes: Vec<(String, Option<String>)>,
+    ) -> String {
+        let mut inner = self.state.lock();
+        inner.next_handle_seq += 1;
+        let id = format!("act-{}", inner.next_handle_seq);
+        inner.action_handles.insert(
+            id.clone(),
+            StoredAction {
+                edits,
+                file_hashes,
+                used: false,
+            },
+        );
+        id
+    }
+
+    /// Look up a handle without consuming it.
+    pub fn action_handle_lookup(&self, id: &str) -> ActionHandleLookup {
+        let inner = self.state.lock();
+        match inner.action_handles.get(id) {
+            None => ActionHandleLookup::Missing,
+            Some(action) if action.used => ActionHandleLookup::Used,
+            Some(action) => ActionHandleLookup::Valid(action.clone()),
+        }
+    }
+
+    /// Spend a handle's single use. Called only after the gate
+    /// allows the apply; the use stays spent even if the applier
+    /// then refuses (a consumed handle never retries blindly).
+    pub fn consume_action_handle(&self, id: &str) {
+        let mut inner = self.state.lock();
+        if let Some(action) = inner.action_handles.get_mut(id) {
+            action.used = true;
+        }
     }
 
     /// Record one gate decision in the session transcript's gate

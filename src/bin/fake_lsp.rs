@@ -390,6 +390,41 @@ impl Fake {
                     respond(writer, id, serde_json::json!([]));
                     return true;
                 }
+                if start_line == 42 {
+                    // An edit set escaping the workspace (P5 item 3
+                    // boundary gate).
+                    respond(
+                        writer,
+                        id,
+                        serde_json::json!([{
+                            "title": "Escape fix",
+                            "kind": "quickfix",
+                            "edit": {"changes": {"file:///etc/passwd": [{
+                                "range": range(0, 0, 0, 1),
+                                "newText": "x"
+                            }]}}
+                        }]),
+                    );
+                    return true;
+                }
+                if start_line == 43 {
+                    // Two overlapping edits on one file (P5 item 3
+                    // applier gate).
+                    let root = self.root_uri.clone();
+                    respond(
+                        writer,
+                        id,
+                        serde_json::json!([{
+                            "title": "Overlap fix",
+                            "kind": "quickfix",
+                            "edit": {"changes": {format!("{root}/src/lib.rs"): [
+                                {"range": range(0, 0, 0, 3), "newText": "aaa"},
+                                {"range": range(0, 1, 0, 2), "newText": "b"}
+                            ]}}
+                        }]),
+                    );
+                    return true;
+                }
                 let root = self.root_uri.clone();
                 respond(
                     writer,
@@ -400,7 +435,7 @@ impl Fake {
                             "title": "Fix the thing",
                             "kind": "quickfix",
                             "edit": {"changes": {format!("{root}/src/lib.rs"): [{
-                                "range": range(1, 0, 1, 5),
+                                "range": range(0, 4, 0, 6),
                                 "newText": "PAYLOAD-MARKER-EDIT"
                             }]}},
                             "command": {

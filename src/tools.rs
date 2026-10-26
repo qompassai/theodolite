@@ -302,25 +302,39 @@ pub fn call_tool(
         "workspace_symbols" => tool_workspace_symbols(manager, arguments),
         "code_actions" => tool_code_actions(manager, arguments),
         "rename_preview" => tool_rename_preview(manager, arguments),
-        "code_action_apply" | "rename_apply" => {
+        "code_action_apply" => {
             // The mutation class exists for a client only when the
             // gate registered it (tools/list and dispatch read the
-            // same decision, so they can never disagree). The apply
-            // implementations land as P5 items 3 and 4; until then a
-            // registered call is a typed GateDenied, never a silent
-            // success.
+            // same decision, so they can never disagree).
             if !crate::gate::mutation_registered(
                 manager.config(),
                 manager.client_identity().as_deref(),
             ) {
                 return Err(BridgeError::UnsupportedMethod {
-                    detail: format!(
-                        "tool {name:?} is not registered for this client (mutation gate)"
-                    ),
+                    detail: "tool \"code_action_apply\" is not registered for this client \
+                             (mutation gate)"
+                        .to_string(),
                 });
             }
+            tool_code_action_apply(manager, arguments)
+        }
+        "rename_apply" => {
+            if !crate::gate::mutation_registered(
+                manager.config(),
+                manager.client_identity().as_deref(),
+            ) {
+                return Err(BridgeError::UnsupportedMethod {
+                    detail: "tool \"rename_apply\" is not registered for this client \
+                             (mutation gate)"
+                        .to_string(),
+                });
+            }
+            // The rename applier lands as P5 item 4; until then a
+            // registered call is a typed GateDenied, never a silent
+            // success.
             Err(BridgeError::GateDenied {
-                detail: format!("{name} is gate-registered; its apply path is not built yet"),
+                detail: "rename_apply is gate-registered; its apply path is not built yet"
+                    .to_string(),
             })
         }
         "session_restart" => tool_session_restart(manager, arguments),
@@ -899,6 +913,45 @@ struct ActionSummary {
     has_command: bool,
 }
 
+/// A listed action plus its retained edit payload (P5 item 3).
+/// The payload is held ONLY so a handle can be minted against it
+/// when the mutation gate registers the apply for this client; it
+/// is never rendered into a result.
+#[derive(Debug)]
+struct ListedAction {
+    summary: ActionSummary,
+    edit: Option<serde_json::Value>,
+}
+
+/// SHA-256 of every target file in a shaped edit set, as of right
+/// now (`None` where the target cannot be read). The listing-time
+/// snapshot a handle is validated against at apply time.
+fn snapshot_file_hashes(files: &[FileEdits]) -> Vec<(String, Option<String>)> {
+    files
+        .iter()
+        .map(|file| {
+            let hash = crate::shaping::uri_to_path(&file.uri)
+                .ok()
+                .and_then(|path| std::fs::read(path).ok())
+                .map(|bytes| crate::config::sha256_hex(&bytes));
+            (file.uri.clone(), hash)
+        })
+        .collect()
+}
+
+/// Whether every snapshotted target still hashes to its snapshot
+/// value. A file missing at snapshot time that has since appeared
+/// (or vice versa) is drift, as is any content change.
+fn file_hashes_current(file_hashes: &[(String, Option<String>)]) -> bool {
+    file_hashes.iter().all(|(uri, expected)| {
+        let current = crate::shaping::uri_to_path(uri)
+            .ok()
+            .and_then(|path| std::fs::read(path).ok())
+            .map(|bytes| crate::config::sha256_hex(&bytes));
+        &current == expected
+    })
+}
+
 fn tool_code_actions(
     manager: &SessionManager,
     arguments: &serde_json::Value,
@@ -963,33 +1016,150 @@ fn tool_code_actions(
         }),
         manager.config().request_timeout_ms,
     )?;
-    let mut actions: Vec<ActionSummary> = Vec::new();
+    let mut actions: Vec<ListedAction> = Vec::new();
     if let Some(entries) = raw.as_array() {
         for entry in entries {
             actions.push(summarize_action(entry));
         }
     }
     actions.sort_by(|a, b| {
-        a.title
-            .cmp(&b.title)
-            .then(a.kind.cmp(&b.kind))
-            .then(a.has_edit.cmp(&b.has_edit))
-            .then(a.has_command.cmp(&b.has_command))
+        a.summary
+            .title
+            .cmp(&b.summary.title)
+            .then(a.summary.kind.cmp(&b.summary.kind))
+            .then(a.summary.has_edit.cmp(&b.summary.has_edit))
+            .then(a.summary.has_command.cmp(&b.summary.has_command))
     });
-    actions.dedup();
+    actions.dedup_by(|next, kept| next.summary == kept.summary);
+    // Handle minting (P5 item 3) happens only when the mutation
+    // gate registers the apply class for THIS client; under any
+    // other posture the listing is byte-identical to P3's. An edit
+    // that fails shaping mints no handle — the action is listed
+    // but not applicable, never silently applicable.
+    let handles: Vec<Option<String>> =
+        if crate::gate::mutation_registered(manager.config(), manager.client_identity().as_deref())
+        {
+            actions
+                .iter()
+                .map(|action| {
+                    if !action.summary.has_edit {
+                        return None;
+                    }
+                    let raw_edit = action.edit.as_ref()?;
+                    let files = crate::edits::shape_workspace_edit(raw_edit).ok()?;
+                    if files.is_empty() {
+                        return None;
+                    }
+                    let file_hashes = snapshot_file_hashes(&files);
+                    Some(session.mint_action_handle(files, file_hashes))
+                })
+                .collect()
+        } else {
+            vec![None; actions.len()]
+        };
     let items: Vec<serde_json::Value> = actions
         .iter()
-        .map(|action| {
-            serde_json::json!({
-                "title": action.title,
-                "kind": action.kind,
-                "has_edit": action.has_edit,
-                "has_command": action.has_command,
-            })
+        .zip(handles.iter())
+        .map(|(action, handle)| {
+            let mut item = serde_json::json!({
+                "title": action.summary.title,
+                "kind": action.summary.kind,
+                "has_edit": action.summary.has_edit,
+                "has_command": action.summary.has_command,
+            });
+            if let Some(handle) = handle {
+                item["handle"] = serde_json::Value::String(handle.clone());
+            }
+            item
         })
         .collect();
     let result = serde_json::json!({"count": items.len(), "actions": items});
     enforce_budget(&result, actions.len(), MAX_RESULT_BYTES)?;
+    Ok(result)
+}
+
+/// `code_action_apply` (P5 item 3): apply ONE listed action by its
+/// opaque handle. The gate decides first — posture, identity,
+/// handle state, version state — and every decision is recorded
+/// in the session transcript. An allowed apply consumes the
+/// handle before writing (a spent handle never retries), writes
+/// through the single applier, and re-syncs the touched files.
+fn tool_code_action_apply(
+    manager: &SessionManager,
+    arguments: &serde_json::Value,
+) -> BridgeResult<serde_json::Value> {
+    if let Some(object) = arguments.as_object() {
+        for key in object.keys() {
+            if !matches!(key.as_str(), "workspace" | "server" | "handle") {
+                return Err(BridgeError::InvalidArgument {
+                    detail: format!(
+                        "code_action_apply takes a handle only; argument {key:?} is refused \
+                         (caller-supplied edit data is never applied)"
+                    ),
+                });
+            }
+        }
+    }
+    let (session, _) = session_for(manager, arguments)?;
+    session.ensure_ready(manager.config())?;
+    let handle = require_string(arguments, "handle")?;
+    let (handle_state, stored) = match session.action_handle_lookup(&handle) {
+        crate::session::ActionHandleLookup::Valid(stored) => {
+            (crate::gate::HandleState::Valid, Some(stored))
+        }
+        crate::session::ActionHandleLookup::Used => (crate::gate::HandleState::Used, None),
+        crate::session::ActionHandleLookup::Missing => (crate::gate::HandleState::Missing, None),
+    };
+    let version_state = match &stored {
+        Some(action) if file_hashes_current(&action.file_hashes) => {
+            crate::gate::VersionState::Current
+        }
+        Some(_) => crate::gate::VersionState::Drifted,
+        None => crate::gate::VersionState::NotApplicable,
+    };
+    let decision = crate::gate::decide(
+        manager.config().mutation,
+        manager.client_identity().as_deref(),
+        &manager.config().mutation_allowlist,
+        handle_state,
+        version_state,
+    );
+    let (outcome, reason) = match &decision {
+        crate::gate::GateDecision::Allow => ("allow", decision.reason()),
+        crate::gate::GateDecision::Deny(reason) => ("deny", reason.clone()),
+    };
+    session.record_gate_decision("code_action_apply", outcome, &reason);
+    if let crate::gate::GateDecision::Deny(reason) = decision {
+        return Err(BridgeError::GateDenied { detail: reason });
+    }
+    let stored = stored.expect("an allowed decision implies a valid stored action");
+    session.consume_action_handle(&handle);
+    let applied = crate::edits::apply_workspace_edit(&session.workspace_root, &stored.edits)?;
+    for file in &applied {
+        // Re-sync what we just wrote so the server's view matches
+        // the disk. A file that vanished between write and sync
+        // (an external race) is left for the next call's sync to
+        // report; the write itself already succeeded and is what
+        // this result attests.
+        if let Ok(path) = crate::shaping::uri_to_path(&file.uri) {
+            let _ = session.sync_file(&path);
+        }
+    }
+    let total_edits: usize = applied.iter().map(|file| file.edits_applied).sum();
+    let mut files: Vec<serde_json::Value> = Vec::with_capacity(applied.len());
+    for file in &applied {
+        files.push(serde_json::json!({
+            "uri": crate::shaping::relativize_uri(&file.uri, &session.workspace_root)?,
+            "edits_applied": file.edits_applied,
+        }));
+    }
+    let result = serde_json::json!({
+        "applied": true,
+        "handle": handle,
+        "files": files,
+        "total_edits": total_edits,
+    });
+    enforce_budget(&result, total_edits, MAX_RESULT_BYTES)?;
     Ok(result)
 }
 
@@ -1009,34 +1179,43 @@ fn ranges_overlap(a: Range, b: Range) -> bool {
 /// `Command`) to its listing summary. The edit and command values
 /// are inspected for presence only and dropped here — this is the
 /// single place payloads could leak, and they do not leave it.
-fn summarize_action(entry: &serde_json::Value) -> ActionSummary {
+fn summarize_action(entry: &serde_json::Value) -> ListedAction {
     let title = entry
         .get("title")
         .and_then(serde_json::Value::as_str)
         .unwrap_or_default()
         .to_string();
     // A bare Command carries `command` as a string and has no kind
-    // or edit of its own.
+    // or edit of its own: command-carrying entries never mint a
+    // handle (applying one would mean executing a server command).
     if entry
         .get("command")
         .is_some_and(serde_json::Value::is_string)
     {
-        return ActionSummary {
-            title,
-            kind: String::new(),
-            has_edit: false,
-            has_command: true,
+        return ListedAction {
+            summary: ActionSummary {
+                title,
+                kind: String::new(),
+                has_edit: false,
+                has_command: true,
+            },
+            edit: None,
         };
     }
-    ActionSummary {
-        title,
-        kind: entry
-            .get("kind")
-            .and_then(serde_json::Value::as_str)
-            .unwrap_or_default()
-            .to_string(),
-        has_edit: entry.get("edit").is_some_and(|edit| !edit.is_null()),
-        has_command: entry.get("command").is_some_and(|cmd| !cmd.is_null()),
+    ListedAction {
+        summary: ActionSummary {
+            title,
+            kind: entry
+                .get("kind")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or_default()
+                .to_string(),
+            has_edit: entry.get("edit").is_some_and(|edit| !edit.is_null()),
+            has_command: entry.get("command").is_some_and(|cmd| !cmd.is_null()),
+        },
+        // Retained (never rendered) solely so the gated apply can
+        // mint a handle against it.
+        edit: entry.get("edit").filter(|edit| !edit.is_null()).cloned(),
     }
 }
 
