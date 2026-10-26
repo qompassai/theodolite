@@ -53,3 +53,25 @@ extensions = ["lua"]
 language_ids = { lua = "lua" }
 readiness = "immediate"
 env = {}
+
+# serve-d (D): plain stdio LSP, no argv — upstream's `--require`
+# values are feature names (`d`, `workspaces`), never component
+# names; an unsupported value makes serve-d refuse to start.
+# `quiescent`: serve-d loads the dub workspace and starts DCD
+# after the handshake and publishes diagnostics when that settles.
+# It spawns `dub`/`dcd-server` by name, so PATH must carry them.
+# Primo note (2026-10-26): the packaged serve-d 0.7.6-1 there
+# cannot launch (it needs libphobos2-ldc-shared.so.111; the system
+# LDC 1.43 ships .113), so this entry stays inert on primo — the
+# version probe refuses it, as designed — until serve-d is rebuilt
+# against the system compiler. See README "Capability notes".
+[[server]]
+id = "serve-d"
+binary = "/usr/bin/serve-d"
+version_probe = ["--version"]
+expect_version = "RECORD-ON-TARGET-MACHINE"
+languages = ["d"]
+extensions = ["d", "di"]
+language_ids = { d = "d", di = "d" }
+readiness = "quiescent"
+env = { PATH = "/usr/local/bin:/usr/bin:/bin" }

@@ -6,7 +6,7 @@
 use std::io::Cursor;
 use std::path::{Path, PathBuf};
 
-use theodolite::config::{Config, MutationPosture};
+use theodolite::config::{Config, MutationPosture, Readiness};
 use theodolite::errors::BridgeError;
 use theodolite::gate::{GateDecision, HandleState, VersionState, decide};
 use theodolite::lsp::{LspMessage, read_message, write_message};
@@ -40,6 +40,23 @@ extensions = ["rs"]
 readiness = "immediate"
 "#;
 
+/// The serve-d registry entry from `bridge.toml.example`, verbatim
+/// in shape: both D extensions share the one LSP language id, and
+/// readiness is the quiescent predicate (workspace load + DCD
+/// startup settle after the handshake).
+const SERVED_SERVER: &str = r#"
+[[server]]
+id = "serve-d"
+binary = "/usr/bin/serve-d"
+version_probe = ["--version"]
+expect_version = "serve-d 0.7.6"
+languages = ["d"]
+extensions = ["d", "di"]
+language_ids = { d = "d", di = "d" }
+readiness = "quiescent"
+env = { PATH = "/usr/local/bin:/usr/bin:/bin" }
+"#;
+
 // --- Validation ----------------------------------------------------
 
 #[test]
@@ -55,6 +72,21 @@ fn config_valid_loads_with_positional_language_pairing() {
     assert_eq!(config.config_hash.len(), 64);
     assert_eq!(config.mutation, MutationPosture::Off);
     assert!(config.mutation_allowlist.is_empty());
+}
+
+#[test]
+fn config_serve_d_entry_loads() {
+    let dir = temp_dir("cfg-served");
+    let path = write_config(&dir, SERVED_SERVER);
+    let config = Config::load(&path).expect("serve-d entry loads");
+    assert_eq!(config.servers.len(), 1);
+    let server = &config.servers[0];
+    assert_eq!(server.id, "serve-d");
+    assert_eq!(server.args, Vec::<String>::new());
+    assert_eq!(server.language_ids.get("d").map(String::as_str), Some("d"));
+    assert_eq!(server.language_ids.get("di").map(String::as_str), Some("d"));
+    assert_eq!(server.readiness, Readiness::Quiescent);
+    assert!(!server.diagnostics_owner);
 }
 
 #[test]
@@ -266,6 +298,25 @@ fn config_violations_are_typed_config_invalid() {
     // Unknown readiness predicate.
     let readiness = VALID_SERVER.replace("immediate", "whenever");
     let error = Config::load(&write_config(&dir, &readiness)).expect_err("bad readiness");
+    assert_eq!(error.code(), "ConfigInvalid");
+}
+
+#[test]
+fn config_serve_d_entry_missing_extension_language_id_is_refused() {
+    let dir = temp_dir("cfg-served-bad");
+    // The `.di` extension declared without a language id: the
+    // bridge would have no didOpen authority for interface files.
+    let bad = SERVED_SERVER.replace(
+        "language_ids = { d = \"d\", di = \"d\" }",
+        "language_ids = { d = \"d\" }",
+    );
+    let error =
+        Config::load(&write_config(&dir, &bad)).expect_err("missing di language id refused");
+    assert_eq!(error.code(), "ConfigInvalid");
+    // The positional-pairing fallback cannot rescue two extensions
+    // against one language either.
+    let bad = SERVED_SERVER.replace("language_ids = { d = \"d\", di = \"d\" }\n", "");
+    let error = Config::load(&write_config(&dir, &bad)).expect_err("unpaired extensions refused");
     assert_eq!(error.code(), "ConfigInvalid");
 }
 

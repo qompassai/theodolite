@@ -29,7 +29,33 @@ closed list by construction.
 
 Servers (config data, not code): bacon-ls (diagnostics owner),
 rust-analyzer (semantics), lua-language-server (second proof
-server).
+server), serve-d (D; config entry and unit coverage landed,
+live-session parity still owed — see Capability notes).
+
+## Capability notes — serve-d
+
+- Plain stdio LSP with no required argv. Upstream's `--require`
+  accepts feature names (`d`, `workspaces`) only; a component
+  name there makes the server intentionally refuse to start, so
+  the registry entry carries no args.
+- serve-d fronts DCD for completion/definition and loads the dub
+  workspace after the handshake; the entry therefore declares
+  `quiescent` readiness and a PATH carrying `dub`/`dcd-server`.
+- Its custom `served/*` requests and `coded/*` notifications stay
+  outside the bridge's closed read surface by construction; the
+  standard read methods are what the tools exercise. Configuration
+  serve-d asks for via `workspace/configuration` (the `d.*`
+  section) is answerable through the entry's `settings` field.
+- Primo status (verified 2026-10-26): the packaged serve-d
+  0.7.6-1 cannot launch — it links `libphobos2-ldc-shared.so.111`
+  and `libdruntime-ldc-shared.so.111`, while the system LDC 1.43
+  ships only the `.113` pair — so on primo the version probe
+  refuses the entry until serve-d is rebuilt against the system
+  compiler (the AUR package rebuilt locally, or an upstream
+  source build with dub + LDC 1.43). `dcd-server`/`dcd-client`
+  0.16.3 and dfmt 0.15.2 on the same machine run fine. A live
+  parity run for this entry is owed once a launchable serve-d
+  exists; nothing here claims one.
 
 ## Mutation class (P5; gated, off by default)
 
