@@ -11,6 +11,8 @@ pinned server sessions and never touches an editor.
 
 Design authority: `~/workspace/lsp-mcp-study-20261025/SPEC.md`.
 Build record: `BUILD-REPORT.md` in this directory.
+Consumer charter (routing vs periscope / SCIP / phlow checks,
+client setup, mutation posture): `docs/CHARTER.md`.
 
 ## Surface (read class; v1 + P3 read-class completion)
 
