@@ -1,17 +1,30 @@
 //! MCP tool definitions and result shaping (SPEC §2 `bridge-tools`,
-//! §6). The surface is read-class only, per the Owner-approved
-//! staged scope: the v1 set (`session_status`, `diagnostics`,
+//! §6). The surface is the v1 set (`session_status`, `diagnostics`,
 //! `hover`, `definition`, `references`, `document_symbols`,
 //! `session_restart`) plus the P3 read-class completion (pull
 //! diagnostics merged into `diagnostics`; the definition family
 //! `declaration` / `type_definition` / `implementation`;
-//! `workspace_symbols`; `code_actions` as a listing only). The
-//! mutation class is not registered at all (SPEC §6 gate posture)
-//! and there is no generic any-LSP-method tool (SPEC §8).
+//! `workspace_symbols`; `code_actions` as a listing only) plus the
+//! P5 staged mutation class:
+//!
+//! - `rename_preview` — preview-class: it computes a rename's full
+//!   edit set and renders it as data, and applies NOTHING. SPEC §6
+//!   classifies the preview as the read-side rename tool ("this is
+//!   the only rename tool in v1" meant the *unapplied* one), so it
+//!   is registered by default and the mutation gate below does NOT
+//!   govern it. The distinction is enforced by construction: the
+//!   preview path holds no applier reference.
+//! - `code_action_apply` / `rename_apply` — the mutation class
+//!   proper: registered only under the decide()-class gate
+//!   (`crate::gate`), absent from `tools/list` otherwise.
+//!
+//! There is no generic any-LSP-method tool (SPEC §8) and no
+//! `edit_file`, ever.
 
 use std::sync::Arc;
 
 use crate::config::Config;
+use crate::edits::{FileEdits, render_file_list, shape_workspace_edit, total_edits};
 use crate::errors::{BridgeError, BridgeResult};
 use crate::session::{Session, SessionManager, resolve_within, validate_workspace};
 use crate::shaping::{
@@ -20,8 +33,12 @@ use crate::shaping::{
     relativize_uri, sort_diagnostics, sort_locations, uri_to_path,
 };
 
-/// Tool names registered, in registration order.
-pub const TOOL_NAMES: [&str; 12] = [
+/// Tool names registered unconditionally (read class plus the
+/// preview-class `rename_preview`), in registration order. The
+/// mutation-class names are separate: they join this list only
+/// when the gate registers them for the connected client (P5
+/// item 2, `registered_tool_names`).
+pub const TOOL_NAMES: [&str; 13] = [
     "session_status",
     "diagnostics",
     "hover",
@@ -33,6 +50,7 @@ pub const TOOL_NAMES: [&str; 12] = [
     "document_symbols",
     "workspace_symbols",
     "code_actions",
+    "rename_preview",
     "session_restart",
 ];
 
@@ -169,6 +187,30 @@ pub fn tool_definitions() -> serde_json::Value {
             &["workspace", "server", "path", "line", "character"],
         ),
         tool(
+            "rename_preview",
+            "Compute a rename's full edit set and render it as data: per-file sorted edit \
+             lists with old text, and totals. Applies NOTHING (applied is always false); \
+             this preview class is registered by default and is not governed by the \
+             mutation gate. When the server advertises prepareRename support its answer \
+             is honored: a position it reports as not renameable returns renameable=false \
+             instead of an edit set. Typed UnsupportedMethod when the server does not \
+             advertise rename support.",
+            serde_json::json!({
+                "workspace": workspace, "server": server, "path": path,
+                "line": {"type": "integer", "minimum": 0},
+                "character": {"type": "integer", "minimum": 0},
+                "new_name": {"type": "string", "description": "The symbol's new name."}
+            }),
+            &[
+                "workspace",
+                "server",
+                "path",
+                "line",
+                "character",
+                "new_name"
+            ],
+        ),
+        tool(
             "session_restart",
             "The only respawn path: tears down the (workspace, server) session and starts a fresh one.",
             serde_json::json!({"workspace": workspace, "server": server}),
@@ -200,6 +242,7 @@ pub fn call_tool(
         "document_symbols" => tool_document_symbols(manager, arguments),
         "workspace_symbols" => tool_workspace_symbols(manager, arguments),
         "code_actions" => tool_code_actions(manager, arguments),
+        "rename_preview" => tool_rename_preview(manager, arguments),
         "session_restart" => tool_session_restart(manager, arguments),
         other => Err(BridgeError::UnsupportedMethod {
             detail: format!("no tool named {other:?} is registered"),
@@ -906,6 +949,119 @@ fn summarize_action(entry: &serde_json::Value) -> ActionSummary {
             .to_string(),
         has_edit: entry.get("edit").is_some_and(|edit| !edit.is_null()),
         has_command: entry.get("command").is_some_and(|cmd| !cmd.is_null()),
+    }
+}
+
+/// The outcome of computing a rename against a live session:
+/// either the server's prepare step refused the position (a real
+/// answer, carried as data), or the shaped edit set.
+enum RenameOutcome {
+    NotRenameable,
+    Edits(Vec<FileEdits>),
+}
+
+/// One computed rename, shared verbatim by `rename_preview`
+/// (item 1) and `rename_apply` (item 4) so the applied set is
+/// always the set the preview path would have rendered.
+struct RenameComputation {
+    session: Arc<Session>,
+    new_name: String,
+    outcome: RenameOutcome,
+}
+
+/// Compute a rename: sync the document, honor `prepareRename`
+/// when the server advertises prepare support, then shape the
+/// `textDocument/rename` WorkspaceEdit. Support is read from the
+/// captured initialize capabilities (P3 discipline), never probed
+/// by trial request. This function performs no writes.
+fn compute_rename(
+    manager: &SessionManager,
+    arguments: &serde_json::Value,
+) -> BridgeResult<RenameComputation> {
+    let (session, _) = session_for(manager, arguments)?;
+    let raw_path = require_string(arguments, "path")?;
+    let absolute = resolve_within(&session.workspace_root, &raw_path)?;
+    let new_name = require_string(arguments, "new_name")?;
+    if new_name.is_empty() {
+        return Err(BridgeError::InvalidArgument {
+            detail: "argument \"new_name\" must not be empty".to_string(),
+        });
+    }
+    session.ensure_ready(manager.config())?;
+    if !session.capability_advertised("renameProvider") {
+        return Err(BridgeError::UnsupportedMethod {
+            detail: format!(
+                "server {} does not advertise renameProvider; rename is unavailable, \
+                 not empty",
+                session.entry.id
+            ),
+        });
+    }
+    let (uri, _version) = session.sync_file(&absolute)?;
+    let line = require_u64(arguments, "line")?;
+    let character = require_u64(arguments, "character")?;
+    let position = serde_json::json!({
+        "textDocument": {"uri": uri},
+        "position": {"line": line, "character": character}
+    });
+    if session.rename_prepare_supported() {
+        let prepared = session.request(
+            "textDocument/prepareRename",
+            position.clone(),
+            manager.config().request_timeout_ms,
+        )?;
+        if prepared.is_null() {
+            return Ok(RenameComputation {
+                session,
+                new_name,
+                outcome: RenameOutcome::NotRenameable,
+            });
+        }
+    }
+    let mut rename_params = position;
+    rename_params["newName"] = serde_json::Value::String(new_name.clone());
+    let raw = session.request(
+        "textDocument/rename",
+        rename_params,
+        manager.config().request_timeout_ms,
+    )?;
+    let files = shape_workspace_edit(&raw)?;
+    Ok(RenameComputation {
+        session,
+        new_name,
+        outcome: RenameOutcome::Edits(files),
+    })
+}
+
+fn tool_rename_preview(
+    manager: &SessionManager,
+    arguments: &serde_json::Value,
+) -> BridgeResult<serde_json::Value> {
+    let computation = compute_rename(manager, arguments)?;
+    match computation.outcome {
+        RenameOutcome::NotRenameable => Ok(serde_json::json!({
+            "applied": false,
+            "renameable": false,
+            "reason": "the server reported this position is not renameable \
+                       (prepareRename returned null)",
+            "new_name": computation.new_name,
+            "files": [],
+            "total_files": 0,
+            "total_edits": 0,
+        })),
+        RenameOutcome::Edits(files) => {
+            let rendered = render_file_list(&computation.session.workspace_root, &files)?;
+            let result = serde_json::json!({
+                "applied": false,
+                "renameable": true,
+                "new_name": computation.new_name,
+                "files": rendered,
+                "total_files": files.len(),
+                "total_edits": total_edits(&files),
+            });
+            enforce_budget(&result, total_edits(&files), MAX_RESULT_BYTES)?;
+            Ok(result)
+        }
     }
 }
 

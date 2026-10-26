@@ -282,6 +282,7 @@ impl Session {
                     "typeDefinition": {},
                     "implementation": {},
                     "documentSymbol": {"hierarchicalDocumentSymbolSupport": true},
+                    "rename": {"prepareSupport": true},
                     "codeAction": {
                         "dynamicRegistration": false,
                         "codeActionLiteralSupport": {"codeActionKind": {"valueSet": [
@@ -642,6 +643,19 @@ impl Session {
     /// (`textDocument/diagnostic`, advertised as `diagnosticProvider`).
     pub fn supports_pull_diagnostics(&self) -> bool {
         self.capability_advertised("diagnosticProvider")
+    }
+
+    /// Whether the server's advertised rename provider declares
+    /// `prepareSupport` (it answers `textDocument/prepareRename`).
+    /// Read from the captured capabilities, never probed.
+    pub fn rename_prepare_supported(&self) -> bool {
+        self.state
+            .lock()
+            .server_capabilities
+            .get("renameProvider")
+            .and_then(|provider| provider.get("prepareSupport"))
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false)
     }
 
     /// URIs of the documents the bridge currently has open, sorted

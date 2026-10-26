@@ -25,7 +25,14 @@
 //! exactly one diagnostics set — the P2 Finding 3 shape, for the P4
 //! settle gates), `never-publish` (answers requests but never
 //! publishes, progresses, or advertises anything — the settle
-//! deadline case).
+//! deadline case). The `rich` mode also serves rename:
+//! `prepareRename` (null at line 99 — not renameable) and `rename`
+//! with scripted edit sets keyed by the requested new name
+//! (`docchanges` = the documentChanges wire shape, `fileops` = a
+//! file rename operation, `huge` = 1 500 edits past the result
+//! budget, `escape` = an edit targeting /etc/passwd, `overlap` =
+//! two overlapping edits, `drift` = rewrites the target file on
+//! disk mid-request before answering — for the P5 gates).
 //!
 //! `$FAKE_LSP_PID_FILE`, when set, receives the fake's pid at start.
 
@@ -140,7 +147,8 @@ impl Fake {
                         "typeDefinitionProvider": true,
                         "implementationProvider": true,
                         "workspaceSymbolProvider": true,
-                        "codeActionProvider": true
+                        "codeActionProvider": true,
+                        "renameProvider": {"prepareSupport": true}
                     }),
                     _ => serde_json::json!({}),
                 };
@@ -413,6 +421,95 @@ impl Fake {
                         }
                     ]),
                 );
+                true
+            }
+            "textDocument/prepareRename" => {
+                let line = params
+                    .get("position")
+                    .and_then(|p| p.get("line"))
+                    .and_then(serde_json::Value::as_u64)
+                    .unwrap_or(0);
+                let character = params
+                    .get("position")
+                    .and_then(|p| p.get("character"))
+                    .and_then(serde_json::Value::as_u64)
+                    .unwrap_or(0);
+                if line == 99 {
+                    // Not renameable: a null result is the answer.
+                    respond(writer, id, serde_json::Value::Null);
+                    return true;
+                }
+                respond(writer, id, range(line, character, line, character + 3));
+                true
+            }
+            "textDocument/rename" => {
+                let new_name = params
+                    .get("newName")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or_default()
+                    .to_string();
+                let root = self.root_uri.clone();
+                let target_uri = params
+                    .get("textDocument")
+                    .and_then(|doc| doc.get("uri"))
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or_default()
+                    .to_string();
+                if new_name == "drift" {
+                    // Rewrite the target file on disk BEFORE
+                    // answering: a version gate comparing pre- and
+                    // post-compute hashes must catch this.
+                    if let Some(path) = target_uri.strip_prefix("file://") {
+                        let _ = std::fs::write(path, "drifted under the bridge\n");
+                    }
+                }
+                let edit = |r: serde_json::Value, text: &str| serde_json::json!({"range": r, "newText": text});
+                let result = match new_name.as_str() {
+                    "huge" => {
+                        let many: Vec<serde_json::Value> = (0..1500u64)
+                            .map(|line| edit(range(line, 0, line, 3), "x"))
+                            .collect();
+                        serde_json::json!({"changes": {format!("{root}/main.rs"): many}})
+                    }
+                    "fileops" => serde_json::json!({
+                        "documentChanges": [{
+                            "kind": "rename",
+                            "oldUri": format!("{root}/main.rs"),
+                            "newUri": format!("{root}/renamed.rs"),
+                            "options": {"overwrite": false}
+                        }]
+                    }),
+                    "docchanges" => serde_json::json!({
+                        "documentChanges": [{
+                            "textDocument": {"uri": format!("{root}/main.rs"), "version": 1},
+                            "edits": [edit(range(0, 3, 0, 6), "docchanges")]
+                        }]
+                    }),
+                    "escape" => serde_json::json!({
+                        "changes": {"file:///etc/passwd": [edit(range(0, 0, 0, 3), "x")]}
+                    }),
+                    "overlap" => serde_json::json!({
+                        "changes": {format!("{root}/main.rs"): [
+                            edit(range(0, 0, 0, 3), "aaa"),
+                            edit(range(0, 1, 0, 2), "b")
+                        ]}
+                    }),
+                    _ => serde_json::json!({
+                        "changes": {
+                            format!("{root}/src/other.rs"): [
+                                edit(range(5, 0, 5, 3), &new_name)
+                            ],
+                            format!("{root}/main.rs"): [
+                                edit(range(5, 16, 5, 19), &new_name),
+                                edit(range(0, 3, 0, 6), &new_name)
+                            ],
+                            format!("{root}/src/lib.rs"): [
+                                edit(range(2, 0, 2, 3), &new_name)
+                            ]
+                        }
+                    }),
+                };
+                respond(writer, id, result);
                 true
             }
             "textDocument/documentSymbol" => {

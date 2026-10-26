@@ -16,6 +16,7 @@
 #![forbid(unsafe_code)]
 
 pub mod config;
+pub mod edits;
 pub mod errors;
 pub mod lsp;
 pub mod mcp;

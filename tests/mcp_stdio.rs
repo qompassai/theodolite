@@ -487,6 +487,110 @@ fn code_actions_lists_titles_kinds_and_payload_presence() {
     bridge.shutdown();
 }
 
+fn rename_args(ws: &Path, new_name: &str) -> serde_json::Value {
+    serde_json::json!({
+        "workspace": ws.to_string_lossy(), "server": "fake",
+        "path": "main.rs", "line": 0, "character": 4, "new_name": new_name
+    })
+}
+
+/// A deterministic digest of every file under `root` (relative
+/// path + contents), for the writes-nothing proofs.
+fn tree_digest(root: &Path) -> String {
+    fn walk(dir: &Path, root: &Path, entries: &mut Vec<(String, Vec<u8>)>) {
+        let mut names: Vec<PathBuf> = std::fs::read_dir(dir)
+            .expect("read dir")
+            .map(|entry| entry.expect("dir entry").path())
+            .collect();
+        names.sort();
+        for path in names {
+            if path.is_dir() {
+                walk(&path, root, entries);
+            } else {
+                let relative = path
+                    .strip_prefix(root)
+                    .expect("inside root")
+                    .to_string_lossy()
+                    .into_owned();
+                entries.push((relative, std::fs::read(&path).expect("read file")));
+            }
+        }
+    }
+    let mut entries = Vec::new();
+    walk(root, root, &mut entries);
+    let mut material = Vec::new();
+    for (relative, bytes) in &entries {
+        material.extend_from_slice(relative.as_bytes());
+        material.push(0);
+        material.extend_from_slice(bytes);
+        material.push(0);
+    }
+    theodolite::config::sha256_hex(&material)
+}
+
+#[test]
+fn rename_preview_shapes_sorts_and_renders_old_text() {
+    let dir = temp_dir("rename-preview");
+    let ws = make_workspace(&dir);
+    let config = write_fake_config(&dir, "rich", "", &[]);
+    let mut bridge = Bridge::spawn(&config);
+    let (is_error, result) = bridge.call_tool("rename_preview", rename_args(&ws, "bar"));
+    assert!(!is_error, "{result}");
+    assert_eq!(result["applied"], false);
+    assert_eq!(result["renameable"], true);
+    assert_eq!(result["total_files"], 3);
+    assert_eq!(result["total_edits"], 4);
+    // Files sorted by URI; the fake scrambled both file and edit
+    // order, so this ordering is the bridge's shaping.
+    let files = result["files"].as_array().expect("files array");
+    assert_eq!(files[0]["uri"], "file:///main.rs");
+    assert_eq!(files[1]["uri"], "file:///src/lib.rs");
+    assert_eq!(files[2]["uri"], "file:///src/other.rs");
+    let main_edits = files[0]["edits"].as_array().expect("main edits");
+    assert_eq!(main_edits.len(), 2);
+    assert_eq!(main_edits[0]["range"]["start"]["line"], 0);
+    assert_eq!(main_edits[0]["old_text"], "foo");
+    assert_eq!(main_edits[0]["new_text"], "bar");
+    assert_eq!(main_edits[1]["range"]["start"]["line"], 5);
+    assert_eq!(main_edits[1]["old_text"], "foo");
+    // Targets that do not exist on disk render old_text as null,
+    // never as invented text.
+    assert_eq!(files[1]["edits"][0]["old_text"], serde_json::Value::Null);
+    bridge.shutdown();
+}
+
+#[test]
+fn rename_preview_not_renameable_is_an_answer_not_an_error() {
+    let dir = temp_dir("rename-not-renameable");
+    let ws = make_workspace(&dir);
+    let config = write_fake_config(&dir, "rich", "", &[]);
+    let mut bridge = Bridge::spawn(&config);
+    let mut arguments = rename_args(&ws, "bar");
+    arguments["line"] = serde_json::json!(99);
+    let (is_error, result) = bridge.call_tool("rename_preview", arguments);
+    assert!(!is_error, "{result}");
+    assert_eq!(result["applied"], false);
+    assert_eq!(result["renameable"], false);
+    assert_eq!(result["total_edits"], 0);
+    bridge.shutdown();
+}
+
+#[test]
+fn rename_preview_accepts_the_document_changes_shape() {
+    let dir = temp_dir("rename-docchanges");
+    let ws = make_workspace(&dir);
+    let config = write_fake_config(&dir, "rich", "", &[]);
+    let mut bridge = Bridge::spawn(&config);
+    let (is_error, result) = bridge.call_tool("rename_preview", rename_args(&ws, "docchanges"));
+    assert!(!is_error, "{result}");
+    assert_eq!(result["total_files"], 1);
+    assert_eq!(result["total_edits"], 1);
+    assert_eq!(result["files"][0]["uri"], "file:///main.rs");
+    assert_eq!(result["files"][0]["edits"][0]["new_text"], "docchanges");
+    assert_eq!(result["files"][0]["edits"][0]["old_text"], "foo");
+    bridge.shutdown();
+}
+
 #[test]
 fn session_restart_returns_a_fresh_transcript() {
     let dir = temp_dir("restart-ok");
@@ -795,12 +899,13 @@ fn mutation_tools_are_absent_and_unregistered() {
             "document_symbols",
             "workspace_symbols",
             "code_actions",
+            "rename_preview",
             "session_restart"
         ]
     );
     for forbidden in [
         "code_action_apply",
-        "rename_preview",
+        "rename_apply",
         "rename_symbol",
         "edit_file",
     ] {
@@ -997,6 +1102,67 @@ fn definition_family_unsupported_is_typed_not_empty() {
             "{tool}: {result}"
         );
     }
+    bridge.shutdown();
+}
+
+#[test]
+fn rename_preview_writes_nothing_even_for_hostile_edit_sets() {
+    let dir = temp_dir("rename-no-writes");
+    let ws = make_workspace(&dir);
+    let config = write_fake_config(&dir, "rich", "", &[]);
+    let mut bridge = Bridge::spawn(&config);
+    let before = tree_digest(&ws);
+    // A normal preview, a documentChanges preview, and two refused
+    // previews: none of them may touch the tree.
+    let (is_error, _) = bridge.call_tool("rename_preview", rename_args(&ws, "bar"));
+    assert!(!is_error);
+    let (is_error, _) = bridge.call_tool("rename_preview", rename_args(&ws, "docchanges"));
+    assert!(!is_error);
+    let (is_error, _) = bridge.call_tool("rename_preview", rename_args(&ws, "fileops"));
+    assert!(is_error);
+    let (is_error, _) = bridge.call_tool("rename_preview", rename_args(&ws, "huge"));
+    assert!(is_error);
+    assert_eq!(tree_digest(&ws), before, "a preview wrote to the tree");
+    bridge.shutdown();
+}
+
+#[test]
+fn rename_preview_unsupported_is_typed_not_empty() {
+    let dir = temp_dir("rename-unsupported");
+    let ws = make_workspace(&dir);
+    // The normal fake advertises no renameProvider.
+    let config = write_fake_config(&dir, "normal", "", &[]);
+    let mut bridge = Bridge::spawn(&config);
+    let (is_error, result) = bridge.call_tool("rename_preview", rename_args(&ws, "bar"));
+    assert!(is_error, "{result}");
+    assert_eq!(Bridge::error_code(&result), "UnsupportedMethod");
+    bridge.shutdown();
+}
+
+#[test]
+fn rename_preview_file_operation_is_a_typed_refusal() {
+    let dir = temp_dir("rename-fileops");
+    let ws = make_workspace(&dir);
+    let config = write_fake_config(&dir, "rich", "", &[]);
+    let mut bridge = Bridge::spawn(&config);
+    let (is_error, result) = bridge.call_tool("rename_preview", rename_args(&ws, "fileops"));
+    assert!(is_error, "{result}");
+    assert_eq!(Bridge::error_code(&result), "UnsupportedMethod");
+    let detail = result["error"]["message"].as_str().unwrap_or("");
+    assert!(detail.contains("file rename operation"), "{result}");
+    bridge.shutdown();
+}
+
+#[test]
+fn rename_preview_huge_edit_set_is_result_too_large() {
+    let dir = temp_dir("rename-huge");
+    let ws = make_workspace(&dir);
+    let config = write_fake_config(&dir, "rich", "", &[]);
+    let mut bridge = Bridge::spawn(&config);
+    let (is_error, result) = bridge.call_tool("rename_preview", rename_args(&ws, "huge"));
+    assert!(is_error, "{result}");
+    assert_eq!(Bridge::error_code(&result), "ResultTooLarge");
+    assert_eq!(result["error"]["items"], 1500);
     bridge.shutdown();
 }
 
