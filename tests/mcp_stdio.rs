@@ -1383,6 +1383,102 @@ fn code_action_handles_are_session_scoped() {
     bridge.shutdown();
 }
 
+/// Give the fake workspace real rename targets matching the
+/// fixture edit ranges: `src/lib.rs` line 2 starts with `foo`,
+/// `src/other.rs` line 5 starts with `foo`.
+fn make_rename_targets(ws: &Path) {
+    std::fs::create_dir_all(ws.join("src")).expect("mkdir src");
+    std::fs::write(ws.join("src/lib.rs"), "aaa\nbbb\nfoo();\n").expect("write lib.rs");
+    std::fs::write(ws.join("src/other.rs"), "l0\nl1\nl2\nl3\nl4\nfoo();\n")
+        .expect("write other.rs");
+}
+
+#[test]
+fn rename_apply_applies_the_previewed_set() {
+    let dir = temp_dir("rename-apply-basic");
+    let ws = make_workspace(&dir);
+    make_rename_targets(&ws);
+    let config = write_fake_config(&dir, "rich", GATED_TOP, &[]);
+    let mut bridge = Bridge::spawn_as(&config, Some("alice"));
+    let (is_error, preview) = bridge.call_tool("rename_preview", rename_args(&ws, "bar"));
+    assert!(!is_error, "{preview}");
+    let (is_error, result) = bridge.call_tool("rename_apply", rename_args(&ws, "bar"));
+    assert!(!is_error, "{result}");
+    assert_eq!(result["applied"], true);
+    assert_eq!(result["renameable"], true);
+    // The applied set is exactly the previewed set.
+    let preview_uris: Vec<&str> = preview["files"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|file| file["uri"].as_str().unwrap())
+        .collect();
+    let applied_uris: Vec<&str> = result["files"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|file| file["uri"].as_str().unwrap())
+        .collect();
+    assert_eq!(preview_uris, applied_uris);
+    assert_eq!(result["total_edits"], preview["total_edits"]);
+    for file in result["files"].as_array().unwrap() {
+        assert_eq!(file["edits"], file["edits_applied"], "{file}");
+    }
+    // Contents on disk carry the rename at every fixture site.
+    let main = std::fs::read_to_string(ws.join("main.rs")).expect("read main.rs");
+    assert!(main.contains("fn bar()"), "{main}");
+    assert!(main.contains("let value = bar();"), "{main}");
+    let lib = std::fs::read_to_string(ws.join("src/lib.rs")).expect("read lib.rs");
+    assert!(lib.contains("bar();"), "{lib}");
+    let other = std::fs::read_to_string(ws.join("src/other.rs")).expect("read other.rs");
+    assert!(other.contains("bar();"), "{other}");
+    bridge.shutdown();
+}
+
+#[test]
+fn rename_apply_refuses_when_a_target_drifts_mid_compute() {
+    let dir = temp_dir("rename-apply-drift");
+    let ws = make_workspace(&dir);
+    make_rename_targets(&ws);
+    let config = write_fake_config(&dir, "rich", GATED_TOP, &[]);
+    let mut bridge = Bridge::spawn_as(&config, Some("alice"));
+    // The fake's "drift" hook rewrites main.rs on disk while the
+    // rename is being computed; the gate must refuse the whole
+    // rename and write nothing anywhere.
+    let (is_error, result) = bridge.call_tool("rename_apply", rename_args(&ws, "drift"));
+    assert!(is_error);
+    assert_eq!(Bridge::error_code(&result), "GateDenied", "{result}");
+    let main = std::fs::read_to_string(ws.join("main.rs")).expect("read main.rs");
+    assert_eq!(main, "drifted under the bridge\n");
+    let lib = std::fs::read_to_string(ws.join("src/lib.rs")).expect("read lib.rs");
+    assert_eq!(lib, "aaa\nbbb\nfoo();\n");
+    let other = std::fs::read_to_string(ws.join("src/other.rs")).expect("read other.rs");
+    assert_eq!(other, "l0\nl1\nl2\nl3\nl4\nfoo();\n");
+    bridge.shutdown();
+}
+
+#[test]
+fn rename_apply_refuses_escaping_fileop_and_overlapping_sets() {
+    let dir = temp_dir("rename-apply-hostile");
+    let ws = make_workspace(&dir);
+    make_rename_targets(&ws);
+    let config = write_fake_config(&dir, "rich", GATED_TOP, &[]);
+    let mut bridge = Bridge::spawn_as(&config, Some("alice"));
+    let before = std::fs::read_to_string(ws.join("main.rs")).expect("read main.rs");
+    for (new_name, code) in [
+        ("escape", "WorkspaceEscape"),
+        ("fileops", "UnsupportedMethod"),
+        ("overlap", "InvalidArgument"),
+    ] {
+        let (is_error, result) = bridge.call_tool("rename_apply", rename_args(&ws, new_name));
+        assert!(is_error, "{new_name}: {result}");
+        assert_eq!(Bridge::error_code(&result), code, "{new_name}: {result}");
+        let after = std::fs::read_to_string(ws.join("main.rs")).expect("re-read main.rs");
+        assert_eq!(after, before, "{new_name} wrote into main.rs");
+    }
+    bridge.shutdown();
+}
+
 #[test]
 fn rename_preview_writes_nothing_even_for_hostile_edit_sets() {
     let dir = temp_dir("rename-no-writes");

@@ -329,13 +329,7 @@ pub fn call_tool(
                         .to_string(),
                 });
             }
-            // The rename applier lands as P5 item 4; until then a
-            // registered call is a typed GateDenied, never a silent
-            // success.
-            Err(BridgeError::GateDenied {
-                detail: "rename_apply is gate-registered; its apply path is not built yet"
-                    .to_string(),
-            })
+            tool_rename_apply(manager, arguments)
         }
         "session_restart" => tool_session_restart(manager, arguments),
         other => Err(BridgeError::UnsupportedMethod {
@@ -395,6 +389,105 @@ fn position_params(
             "position": {"line": line, "character": character}
         }),
     ))
+}
+
+/// `rename_apply` (P5 item 4): recompute exactly as the preview
+/// computes, then apply — under the same gate and through the
+/// same applier as `code_action_apply`. Before computing, the
+/// bridge snapshots the hash of every document it tracks for the
+/// session (all open documents plus the named file); if any of
+/// them changed by the time the edit set exists, the rename is
+/// refused whole — a write is never based on a set computed
+/// against state that has already moved. The result mirrors the
+/// preview's shape and adds `applied: true` plus per-file
+/// written counts, so the two tools' results can never be
+/// confused.
+fn tool_rename_apply(
+    manager: &SessionManager,
+    arguments: &serde_json::Value,
+) -> BridgeResult<serde_json::Value> {
+    let (session, _) = session_for(manager, arguments)?;
+    session.ensure_ready(manager.config())?;
+    let raw_path = require_string(arguments, "path")?;
+    let absolute = resolve_within(&session.workspace_root, &raw_path)?;
+    let mut tracked = session.open_document_uris();
+    let primary_uri = crate::shaping::path_to_uri(&absolute);
+    if !tracked.contains(&primary_uri) {
+        tracked.push(primary_uri);
+    }
+    let before: Vec<(String, Option<String>)> = tracked
+        .iter()
+        .map(|uri| (uri.clone(), hash_of_uri(uri)))
+        .collect();
+    let computation = compute_rename(manager, arguments)?;
+    let session = computation.session;
+    let files = match computation.outcome {
+        RenameOutcome::NotRenameable => {
+            return Ok(serde_json::json!({
+                "applied": false,
+                "renameable": false,
+                "reason": "the server reported this position is not renameable \
+                           (prepareRename returned null)",
+                "new_name": computation.new_name,
+                "files": [],
+                "total_files": 0,
+                "total_edits": 0
+            }));
+        }
+        RenameOutcome::Edits(files) => files,
+    };
+    let drifted = before
+        .iter()
+        .any(|(uri, expected)| &hash_of_uri(uri) != expected);
+    let decision = crate::gate::decide(
+        manager.config().mutation,
+        manager.client_identity().as_deref(),
+        &manager.config().mutation_allowlist,
+        crate::gate::HandleState::NotApplicable,
+        if drifted {
+            crate::gate::VersionState::Drifted
+        } else {
+            crate::gate::VersionState::Current
+        },
+    );
+    let (outcome, reason) = match &decision {
+        crate::gate::GateDecision::Allow => ("allow", decision.reason()),
+        crate::gate::GateDecision::Deny(reason) => ("deny", reason.clone()),
+    };
+    session.record_gate_decision("rename_apply", outcome, &reason);
+    if let crate::gate::GateDecision::Deny(reason) = decision {
+        return Err(BridgeError::GateDenied { detail: reason });
+    }
+    let applied = crate::edits::apply_workspace_edit(&session.workspace_root, &files)?;
+    for file in &applied {
+        // Same post-apply re-sync contract as code_action_apply.
+        if let Ok(path) = crate::shaping::uri_to_path(&file.uri) {
+            let _ = session.sync_file(&path);
+        }
+    }
+    let counts: std::collections::HashMap<&str, usize> = applied
+        .iter()
+        .map(|file| (file.uri.as_str(), file.edits_applied))
+        .collect();
+    let mut rendered: Vec<serde_json::Value> = Vec::with_capacity(files.len());
+    for file in &files {
+        rendered.push(serde_json::json!({
+            "uri": crate::shaping::relativize_uri(&file.uri, &session.workspace_root)?,
+            "edits": file.edits.len(),
+            "edits_applied": counts.get(file.uri.as_str()).copied().unwrap_or(0),
+        }));
+    }
+    let total_edits = crate::edits::total_edits(&files);
+    let result = serde_json::json!({
+        "applied": true,
+        "renameable": true,
+        "new_name": computation.new_name,
+        "files": rendered,
+        "total_files": files.len(),
+        "total_edits": total_edits
+    });
+    enforce_budget(&result, total_edits, MAX_RESULT_BYTES)?;
+    Ok(result)
 }
 
 fn tool_session_status(
@@ -923,19 +1016,23 @@ struct ListedAction {
     edit: Option<serde_json::Value>,
 }
 
+/// The current SHA-256 of one URI's target (`None` where it
+/// cannot be read — a missing target at snapshot time that has
+/// since appeared is drift, as is any content change).
+fn hash_of_uri(uri: &str) -> Option<String> {
+    crate::shaping::uri_to_path(uri)
+        .ok()
+        .and_then(|path| std::fs::read(path).ok())
+        .map(|bytes| crate::config::sha256_hex(&bytes))
+}
+
 /// SHA-256 of every target file in a shaped edit set, as of right
-/// now (`None` where the target cannot be read). The listing-time
-/// snapshot a handle is validated against at apply time.
+/// now. The listing-time snapshot a handle is validated against
+/// at apply time.
 fn snapshot_file_hashes(files: &[FileEdits]) -> Vec<(String, Option<String>)> {
     files
         .iter()
-        .map(|file| {
-            let hash = crate::shaping::uri_to_path(&file.uri)
-                .ok()
-                .and_then(|path| std::fs::read(path).ok())
-                .map(|bytes| crate::config::sha256_hex(&bytes));
-            (file.uri.clone(), hash)
-        })
+        .map(|file| (file.uri.clone(), hash_of_uri(&file.uri)))
         .collect()
 }
 
@@ -943,13 +1040,9 @@ fn snapshot_file_hashes(files: &[FileEdits]) -> Vec<(String, Option<String>)> {
 /// value. A file missing at snapshot time that has since appeared
 /// (or vice versa) is drift, as is any content change.
 fn file_hashes_current(file_hashes: &[(String, Option<String>)]) -> bool {
-    file_hashes.iter().all(|(uri, expected)| {
-        let current = crate::shaping::uri_to_path(uri)
-            .ok()
-            .and_then(|path| std::fs::read(path).ok())
-            .map(|bytes| crate::config::sha256_hex(&bytes));
-        &current == expected
-    })
+    file_hashes
+        .iter()
+        .all(|(uri, expected)| &hash_of_uri(uri) == expected)
 }
 
 fn tool_code_actions(
