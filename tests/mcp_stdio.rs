@@ -83,6 +83,13 @@ struct Bridge {
 
 impl Bridge {
     fn spawn(config: &Path) -> Bridge {
+        Bridge::spawn_as(config, None)
+    }
+
+    /// Spawn and complete the MCP handshake, asserting a client
+    /// identity (`clientInfo.name`) when `client` is given. The
+    /// mutation gate decides on exactly this identity (P5 item 2).
+    fn spawn_as(config: &Path, client: Option<&str>) -> Bridge {
         let mut child = Command::new(bridge_bin())
             .arg("--config")
             .arg(config)
@@ -99,10 +106,11 @@ impl Bridge {
             stdout,
             next_id: 0,
         };
-        let response = bridge.request(
-            "initialize",
-            serde_json::json!({"protocolVersion": "2024-11-05"}),
-        );
+        let mut params = serde_json::json!({"protocolVersion": "2024-11-05"});
+        if let Some(name) = client {
+            params["clientInfo"] = serde_json::json!({"name": name, "version": "test"});
+        }
+        let response = bridge.request("initialize", params);
         assert_eq!(response["result"]["serverInfo"]["name"], "theodolite");
         bridge
     }
@@ -1103,6 +1111,95 @@ fn definition_family_unsupported_is_typed_not_empty() {
         );
     }
     bridge.shutdown();
+}
+
+fn listed_tool_names(bridge: &mut Bridge) -> Vec<String> {
+    let frame = bridge.request("tools/list", serde_json::json!({}));
+    frame["result"]["tools"]
+        .as_array()
+        .expect("tools array")
+        .iter()
+        .map(|tool| tool["name"].as_str().unwrap_or("").to_string())
+        .collect()
+}
+
+#[test]
+fn mutation_tools_register_only_for_an_allowlisted_identity() {
+    let dir = temp_dir("gate-registration");
+    let ws = make_workspace(&dir);
+    let config = write_fake_config(
+        &dir,
+        "rich",
+        "mutation = \"gated\"\nmutation_allowlist = [\"alice\"]",
+        &[],
+    );
+    // No handshake identity at all: fail closed, no mutation tools.
+    let mut bridge = Bridge::spawn(&config);
+    let names = listed_tool_names(&mut bridge);
+    assert_eq!(names.len(), 13, "{names:?}");
+    assert!(!names.iter().any(|n| n == "code_action_apply"));
+    let (is_error, result) = bridge.call_tool(
+        "code_action_apply",
+        serde_json::json!({
+            "workspace": ws.to_string_lossy(), "server": "fake", "handle": "act-1"
+        }),
+    );
+    assert!(is_error);
+    assert_eq!(Bridge::error_code(&result), "UnsupportedMethod");
+    bridge.shutdown();
+    // A named but non-allowlisted client: same absence.
+    let mut bridge = Bridge::spawn_as(&config, Some("mallory"));
+    let names = listed_tool_names(&mut bridge);
+    assert_eq!(names.len(), 13, "{names:?}");
+    bridge.shutdown();
+    // The allowlisted client: both mutation tools register, and the
+    // session transcript records the registration decision inputs.
+    let mut bridge = Bridge::spawn_as(&config, Some("alice"));
+    let names = listed_tool_names(&mut bridge);
+    assert_eq!(names.len(), 15, "{names:?}");
+    assert!(names.iter().any(|n| n == "code_action_apply"));
+    assert!(names.iter().any(|n| n == "rename_apply"));
+    let _ = bridge.call_tool("hover", hover_args(&ws));
+    let (is_error, status) = bridge.call_tool(
+        "session_status",
+        serde_json::json!({"workspace": ws.to_string_lossy(), "server": "fake"}),
+    );
+    assert!(!is_error, "{status}");
+    assert_eq!(status["client_identity"], "alice");
+    assert_eq!(status["mutation_registered"], true);
+    assert_eq!(status["mutation"], "gated");
+    bridge.shutdown();
+}
+
+#[test]
+fn ambiguous_mutation_config_refuses_to_start() {
+    let dir = temp_dir("gate-config-refusal");
+    let _ = make_workspace(&dir);
+    for (tag, extra_top) in [
+        ("gated-no-list", "mutation = \"gated\""),
+        ("list-while-off", "mutation_allowlist = [\"alice\"]"),
+    ] {
+        let config = write_fake_config(&dir, "normal", extra_top, &[]);
+        let mut child = Command::new(bridge_bin())
+            .arg("--config")
+            .arg(&config)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("spawn bridge");
+        drop(child.stdin.take());
+        let output = child.wait_with_output().expect("bridge exits");
+        assert!(
+            !output.status.success(),
+            "{tag}: bridge started on an ambiguous posture"
+        );
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            stderr.contains("ConfigInvalid"),
+            "{tag}: stderr lacks the typed refusal: {stderr}"
+        );
+    }
 }
 
 #[test]

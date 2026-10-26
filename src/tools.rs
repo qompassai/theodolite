@@ -54,10 +54,29 @@ pub const TOOL_NAMES: [&str; 13] = [
     "session_restart",
 ];
 
+/// The mutation-class tool names, in registration order. They are
+/// registered only when the gate offers them to the connected
+/// client (`crate::gate::mutation_registered`); everywhere else
+/// they are absent, and a call to one is `UnsupportedMethod`
+/// exactly like a call to a tool that does not exist.
+pub const MUTATION_TOOL_NAMES: [&str; 2] = ["code_action_apply", "rename_apply"];
+
+/// The full registration list for one connection: the standing
+/// names plus, when the gate registers them, the mutation class.
+pub fn registered_tool_names(config: &Config, client_identity: Option<&str>) -> Vec<&'static str> {
+    let mut names: Vec<&'static str> = TOOL_NAMES.to_vec();
+    if crate::gate::mutation_registered(config, client_identity) {
+        names.extend(MUTATION_TOOL_NAMES);
+    }
+    names
+}
+
 /// JSON schemas for `tools/list`. Every tool names its workspace
 /// explicitly and (except `session_status` on unstarted sessions)
-/// syncs the file it names before asking the server anything.
-pub fn tool_definitions() -> serde_json::Value {
+/// syncs the file it names before asking the server anything. The
+/// mutation-class schemas are appended only when the gate
+/// registers them for this client (P5 item 2).
+pub fn tool_definitions(config: &Config, client_identity: Option<&str>) -> serde_json::Value {
     let workspace = serde_json::json!({
         "type": "string", "description": "Absolute path of the workspace root."
     });
@@ -94,7 +113,7 @@ pub fn tool_definitions() -> serde_json::Value {
             }
         })
     };
-    serde_json::json!([
+    let mut tools = vec![
         tool(
             "session_status",
             "Session transcript: pinned binary, actual version, workspace, readiness, open documents.",
@@ -207,7 +226,7 @@ pub fn tool_definitions() -> serde_json::Value {
                 "path",
                 "line",
                 "character",
-                "new_name"
+                "new_name",
             ],
         ),
         tool(
@@ -216,7 +235,47 @@ pub fn tool_definitions() -> serde_json::Value {
             serde_json::json!({"workspace": workspace, "server": server}),
             &["workspace", "server"],
         ),
-    ])
+    ];
+    if crate::gate::mutation_registered(config, client_identity) {
+        tools.push(tool(
+            "code_action_apply",
+            "Apply ONE code action previously listed by `code_actions` in this session, \
+             named by its opaque handle only (a caller-supplied edit is refused). \
+             Gate-decided at apply time: the handle must be valid and single-use, and \
+             every target document must still hash to its listing-time bytes. Writes \
+             are boundary-checked and atomic per file. Registered only under the \
+             mutation gate for allowlisted clients.",
+            serde_json::json!({
+                "workspace": workspace, "server": server,
+                "handle": {"type": "string", "description": "Opaque handle minted by a code_actions listing in this session."}
+            }),
+            &["workspace", "server", "handle"],
+        ));
+        tools.push(tool(
+            "rename_apply",
+            "Recompute a rename (exactly as `rename_preview` computes it) and APPLY it \
+             through the same gated applier: every target is re-validated against its \
+             compute-time state, boundary-checked, and written atomically per file; \
+             any drift refuses the whole rename with nothing written. The result \
+             carries applied=true, unlike the preview's applied=false. Registered \
+             only under the mutation gate for allowlisted clients.",
+            serde_json::json!({
+                "workspace": workspace, "server": server, "path": path,
+                "line": {"type": "integer", "minimum": 0},
+                "character": {"type": "integer", "minimum": 0},
+                "new_name": {"type": "string", "description": "The symbol's new name."}
+            }),
+            &[
+                "workspace",
+                "server",
+                "path",
+                "line",
+                "character",
+                "new_name",
+            ],
+        ));
+    }
+    serde_json::Value::Array(tools)
 }
 
 /// Dispatch one `tools/call`. The return value is the canonical
@@ -243,6 +302,27 @@ pub fn call_tool(
         "workspace_symbols" => tool_workspace_symbols(manager, arguments),
         "code_actions" => tool_code_actions(manager, arguments),
         "rename_preview" => tool_rename_preview(manager, arguments),
+        "code_action_apply" | "rename_apply" => {
+            // The mutation class exists for a client only when the
+            // gate registered it (tools/list and dispatch read the
+            // same decision, so they can never disagree). The apply
+            // implementations land as P5 items 3 and 4; until then a
+            // registered call is a typed GateDenied, never a silent
+            // success.
+            if !crate::gate::mutation_registered(
+                manager.config(),
+                manager.client_identity().as_deref(),
+            ) {
+                return Err(BridgeError::UnsupportedMethod {
+                    detail: format!(
+                        "tool {name:?} is not registered for this client (mutation gate)"
+                    ),
+                });
+            }
+            Err(BridgeError::GateDenied {
+                detail: format!("{name} is gate-registered; its apply path is not built yet"),
+            })
+        }
         "session_restart" => tool_session_restart(manager, arguments),
         other => Err(BridgeError::UnsupportedMethod {
             detail: format!("no tool named {other:?} is registered"),
@@ -321,6 +401,14 @@ fn tool_session_status(
             let mut transcript = session.transcript(manager.config());
             transcript["pid"] = serde_json::Value::Number(pid.into());
             transcript["alive"] = serde_json::Value::Bool(alive);
+            transcript["client_identity"] = manager
+                .client_identity()
+                .map_or(serde_json::Value::Null, serde_json::Value::String);
+            transcript["mutation_registered"] =
+                serde_json::Value::Bool(crate::gate::mutation_registered(
+                    manager.config(),
+                    manager.client_identity().as_deref(),
+                ));
             Ok(transcript)
         }
         None => Ok(serde_json::json!({

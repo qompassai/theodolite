@@ -83,6 +83,29 @@ pub struct ServerEntry {
     pub diagnostics_owner: bool,
 }
 
+/// Mutation posture (SPEC §6): a configuration state, never a
+/// runtime prompt. `Off` registers no mutation tools at all;
+/// `Gated` registers them for allowlisted client identities only,
+/// behind the decide()-class gate (`crate::gate`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MutationPosture {
+    /// No mutation tools, for any client.
+    Off,
+    /// Mutation tools for allowlisted identities, gate-decided
+    /// again at every apply.
+    Gated,
+}
+
+impl MutationPosture {
+    /// The config-file / transcript string for this posture.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            MutationPosture::Off => "off",
+            MutationPosture::Gated => "gated",
+        }
+    }
+}
+
 /// The whole validated bridge configuration.
 #[derive(Debug, Clone)]
 pub struct Config {
@@ -96,9 +119,13 @@ pub struct Config {
     pub shutdown_grace_ms: u64,
     /// SHA-256 of the config file bytes, for session transcripts.
     pub config_hash: String,
-    /// Mutation posture. v1 accepts only `"off"`; anything else is a
-    /// config error, so the gate posture can never drift on silently.
-    pub mutation: String,
+    /// Mutation posture, validated as one unambiguous state: an
+    /// allowlist without the gated posture, or the gated posture
+    /// without a non-empty allowlist, refuses to start (P5 item 2).
+    pub mutation: MutationPosture,
+    /// Client identities (`clientInfo.name` values) allowed the
+    /// mutation class under the gated posture. Empty when off.
+    pub mutation_allowlist: Vec<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -108,6 +135,7 @@ struct RawConfig {
     ready_timeout_ms: Option<u64>,
     shutdown_grace_ms: Option<u64>,
     mutation: Option<String>,
+    mutation_allowlist: Option<Vec<String>>,
     server: Vec<RawServer>,
 }
 
@@ -155,15 +183,44 @@ impl Config {
     }
 
     fn validate(raw: RawConfig, config_hash: String) -> BridgeResult<Config> {
-        let mutation = raw.mutation.unwrap_or_else(|| "off".to_string());
-        if mutation != "off" {
-            return Err(BridgeError::ConfigInvalid {
-                detail: format!(
-                    "mutation posture {mutation:?}: v1 ships read-only; the mutation class is \
-                     unimplemented and unregistered"
-                ),
-            });
-        }
+        // The mutation posture is validated as ONE state, never as
+        // two knobs that can half-agree (P5 item 2): unknown values,
+        // gated-without-an-allowlist, and an-allowlist-while-off
+        // are all startup refusals with typed reasons.
+        let posture_raw = raw.mutation.as_deref().unwrap_or("off");
+        let mutation = match posture_raw {
+            "off" => MutationPosture::Off,
+            "gated" => MutationPosture::Gated,
+            other => {
+                return Err(BridgeError::ConfigInvalid {
+                    detail: format!(
+                        "unknown mutation posture {other:?} (expected \"off\" or \"gated\")"
+                    ),
+                });
+            }
+        };
+        let mutation_allowlist = match (mutation, &raw.mutation_allowlist) {
+            (MutationPosture::Off, Some(_)) => {
+                return Err(BridgeError::ConfigInvalid {
+                    detail: "mutation_allowlist is present while mutation posture is \"off\"; \
+                             an allowlist without the gated posture is an ambiguous posture"
+                        .to_string(),
+                });
+            }
+            (MutationPosture::Off, None) => Vec::new(),
+            (MutationPosture::Gated, Some(list))
+                if !list.is_empty() && list.iter().all(|name| !name.trim().is_empty()) =>
+            {
+                list.clone()
+            }
+            (MutationPosture::Gated, _) => {
+                return Err(BridgeError::ConfigInvalid {
+                    detail: "mutation posture \"gated\" requires a non-empty \
+                             mutation_allowlist of client identity names"
+                        .to_string(),
+                });
+            }
+        };
         if raw.server.is_empty() {
             return Err(BridgeError::ConfigInvalid {
                 detail: "config declares no servers".to_string(),
@@ -187,6 +244,7 @@ impl Config {
             shutdown_grace_ms: raw.shutdown_grace_ms.unwrap_or(DEFAULT_SHUTDOWN_GRACE_MS),
             config_hash,
             mutation,
+            mutation_allowlist,
         })
     }
 

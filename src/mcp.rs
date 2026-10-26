@@ -113,6 +113,17 @@ fn handle_frame(manager: &SessionManager, frame: &[u8]) -> Option<String> {
     let id = id?;
     let response = match method {
         "initialize" => {
+            // The handshake's clientInfo.name is the client identity
+            // the mutation gate decides on (P5 item 2). Absent
+            // clientInfo records NO identity — fail closed.
+            manager.set_client_identity(
+                value
+                    .get("params")
+                    .and_then(|p| p.get("clientInfo"))
+                    .and_then(|info| info.get("name"))
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::to_string),
+            );
             let client_version = value
                 .get("params")
                 .and_then(|p| p.get("protocolVersion"))
@@ -128,7 +139,12 @@ fn handle_frame(manager: &SessionManager, frame: &[u8]) -> Option<String> {
             })
         }
         "ping" => serde_json::json!({}),
-        "tools/list" => serde_json::json!({"tools": tools::tool_definitions()}),
+        "tools/list" => serde_json::json!({
+            "tools": tools::tool_definitions(
+                manager.config(),
+                manager.client_identity().as_deref(),
+            )
+        }),
         "tools/call" => return Some(handle_tools_call(manager, &id, &value)),
         other => {
             return Some(error_frame(

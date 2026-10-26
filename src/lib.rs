@@ -18,6 +18,7 @@
 pub mod config;
 pub mod edits;
 pub mod errors;
+pub mod gate;
 pub mod lsp;
 pub mod mcp;
 pub mod session;

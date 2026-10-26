@@ -18,6 +18,7 @@ use std::sync::{Arc, Mutex, mpsc};
 use std::time::{Duration, Instant};
 
 use crate::config::{Config, Readiness, ServerEntry, sha256_hex};
+use crate::edits::FileEdits;
 use crate::errors::{BridgeError, BridgeResult, io_error};
 use crate::lsp::{LspMessage, read_message, write_message};
 use crate::shaping::{Diagnostic, DiagnosticChannel, diagnostics_from_lsp};
@@ -67,6 +68,41 @@ struct OpenDocument {
     size: u64,
 }
 
+/// Gate-log capacity per session (P5 item 2): decisions are
+/// metadata, but the log is still bounded like everything else in
+/// the bridge; the oldest entries drop first.
+pub const GATE_LOG_MAX: usize = 256;
+
+/// One recorded gate decision (transcript metadata only).
+#[derive(Debug, Clone)]
+pub struct GateLogEntry {
+    /// The mutation tool the decision concerned.
+    pub tool: String,
+    /// `"allow"` or `"deny"`.
+    pub decision: String,
+    /// The decide() reason, verbatim.
+    pub reason: String,
+}
+
+/// One minted action handle's stored state (P5 item 3): the shaped
+/// edit set a `code_actions` listing offered, the listing-time
+/// SHA-256 of every target file (`None` where the target did not
+/// exist at listing), and the single-use flag. Handles live and
+/// die with their session; nothing here is ever rendered into a
+/// listing result beyond the opaque id. (The store itself lands
+/// with item 3; the type is defined here because the gate's
+/// vocabulary is incomplete without it.)
+#[derive(Debug, Clone)]
+pub struct StoredAction {
+    /// The shaped edit set to apply.
+    pub edits: Vec<FileEdits>,
+    /// (absolute uri, listing-time hash) per target file.
+    pub file_hashes: Vec<(String, Option<String>)>,
+    /// Set when the handle's one use is spent (spent even when the
+    /// applier then refuses: a consumed handle never retries).
+    pub used: bool,
+}
+
 #[derive(Debug)]
 struct Inner {
     phase: Phase,
@@ -98,6 +134,10 @@ struct Inner {
     /// this, never probed by trial request: an unadvertised feature
     /// is a typed `UnsupportedMethod`, not a server error.
     server_capabilities: serde_json::Value,
+    /// Gate decisions recorded for the transcript (P5 item 2):
+    /// metadata only — tool, outcome, reason. No edit bodies, no
+    /// file contents, ever.
+    gate_log: Vec<GateLogEntry>,
     stderr_ring: VecDeque<u8>,
     exit_status: Option<String>,
     protocol_violations: u64,
@@ -134,6 +174,7 @@ impl SessionState {
                 last_quiescent_seq: 0,
                 progress_completed: 0,
                 server_capabilities: serde_json::Value::Null,
+                gate_log: Vec::new(),
                 stderr_ring: VecDeque::new(),
                 exit_status: None,
                 protocol_violations: 0,
@@ -645,6 +686,20 @@ impl Session {
         self.capability_advertised("diagnosticProvider")
     }
 
+    /// Record one gate decision in the session transcript's gate
+    /// log (P5 item 2). Metadata only: tool, outcome, reason.
+    pub fn record_gate_decision(&self, tool: &str, decision: &str, reason: &str) {
+        let mut inner = self.state.lock();
+        if inner.gate_log.len() >= GATE_LOG_MAX {
+            inner.gate_log.remove(0);
+        }
+        inner.gate_log.push(GateLogEntry {
+            tool: tool.to_string(),
+            decision: decision.to_string(),
+            reason: reason.to_string(),
+        });
+    }
+
     /// Whether the server's advertised rename provider declares
     /// `prepareSupport` (it answers `textDocument/prepareRename`).
     /// Read from the captured capabilities, never probed.
@@ -786,7 +841,11 @@ impl Session {
             "open_documents": inner.documents.len(),
             "progress_cycles_completed": inner.progress_completed,
             "protocol_violations": inner.protocol_violations,
-            "mutation": config.mutation,
+            "mutation": config.mutation.as_str(),
+            "mutation_allowlist_size": config.mutation_allowlist.len(),
+            "gate_decisions": inner.gate_log.iter().map(|entry| serde_json::json!({
+                "tool": entry.tool, "decision": entry.decision, "reason": entry.reason
+            })).collect::<Vec<_>>(),
         });
         if let Phase::Dead(detail) = &inner.phase {
             value["dead_detail"] = serde_json::Value::String(detail.clone());
@@ -890,6 +949,15 @@ pub struct SessionManager {
     config: Arc<Config>,
     sessions: Mutex<HashMap<(PathBuf, String), Arc<Session>>>,
     started: Instant,
+    /// The connected client's identity: the `clientInfo.name` from
+    /// the MCP `initialize` handshake (P5 item 2). The bridge
+    /// serves one client per process; `None` until a handshake
+    /// names one, and a handshake without `clientInfo` leaves it
+    /// `None` — under the gated mutation posture that means no
+    /// mutation tools, fail closed. This is a routing label the
+    /// client asserts about itself inside the MCP host's process
+    /// boundary (SPEC §8's auth model), not an authentication.
+    client_identity: Mutex<Option<String>>,
 }
 
 impl SessionManager {
@@ -899,12 +967,31 @@ impl SessionManager {
             config,
             sessions: Mutex::new(HashMap::new()),
             started: Instant::now(),
+            client_identity: Mutex::new(None),
         }
     }
 
     /// The bound config.
     pub fn config(&self) -> &Config {
         &self.config
+    }
+
+    /// Record the client identity from the MCP handshake. An empty
+    /// or whitespace name is no identity at all (fail closed).
+    pub fn set_client_identity(&self, name: Option<String>) {
+        let cleaned = name.filter(|value| !value.trim().is_empty());
+        *self
+            .client_identity
+            .lock()
+            .unwrap_or_else(|p| p.into_inner()) = cleaned;
+    }
+
+    /// The connected client's asserted identity, if any.
+    pub fn client_identity(&self) -> Option<String> {
+        self.client_identity
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .clone()
     }
 
     /// Get the live session for a key, starting it on first use. A

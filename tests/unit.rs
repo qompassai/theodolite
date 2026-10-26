@@ -6,8 +6,9 @@
 use std::io::Cursor;
 use std::path::{Path, PathBuf};
 
-use theodolite::config::Config;
+use theodolite::config::{Config, MutationPosture};
 use theodolite::errors::BridgeError;
+use theodolite::gate::{GateDecision, HandleState, VersionState, decide};
 use theodolite::lsp::{LspMessage, read_message, write_message};
 use theodolite::session::resolve_within;
 use theodolite::shaping::{
@@ -52,7 +53,45 @@ fn config_valid_loads_with_positional_language_pairing() {
         Some("rust")
     );
     assert_eq!(config.config_hash.len(), 64);
-    assert_eq!(config.mutation, "off");
+    assert_eq!(config.mutation, MutationPosture::Off);
+    assert!(config.mutation_allowlist.is_empty());
+}
+
+#[test]
+fn config_gated_with_allowlist_loads() {
+    let dir = temp_dir("cfg-gated");
+    let body =
+        format!("mutation = \"gated\"\nmutation_allowlist = [\"alice\", \"bob\"]\n{VALID_SERVER}");
+    let config = Config::load(&write_config(&dir, &body)).expect("gated config loads");
+    assert_eq!(config.mutation, MutationPosture::Gated);
+    assert_eq!(config.mutation_allowlist, vec!["alice", "bob"]);
+}
+
+#[test]
+fn gate_decide_allows_the_full_pass() {
+    let allowlist = vec!["alice".to_string()];
+    // The apply shape: valid handle, current versions.
+    assert_eq!(
+        decide(
+            MutationPosture::Gated,
+            Some("alice"),
+            &allowlist,
+            HandleState::Valid,
+            VersionState::Current
+        ),
+        GateDecision::Allow
+    );
+    // The registration shape: no handle, no version state.
+    assert_eq!(
+        decide(
+            MutationPosture::Gated,
+            Some("alice"),
+            &allowlist,
+            HandleState::NotApplicable,
+            VersionState::NotApplicable
+        ),
+        GateDecision::Allow
+    );
 }
 
 #[test]
@@ -219,14 +258,124 @@ fn config_violations_are_typed_config_invalid() {
     let dup = format!("{VALID_SERVER}\n{VALID_SERVER}");
     let error = Config::load(&write_config(&dir, &dup)).expect_err("duplicate id refused");
     assert_eq!(error.code(), "ConfigInvalid");
-    // Mutation posture other than off.
+    // Gated posture without an allowlist: an ambiguous posture,
+    // refused at startup, never silently defaulted.
     let gated = format!("mutation = \"gated\"\n{VALID_SERVER}");
-    let error = Config::load(&write_config(&dir, &gated)).expect_err("mutation refused in v1");
+    let error = Config::load(&write_config(&dir, &gated)).expect_err("gated without allowlist");
     assert_eq!(error.code(), "ConfigInvalid");
     // Unknown readiness predicate.
     let readiness = VALID_SERVER.replace("immediate", "whenever");
     let error = Config::load(&write_config(&dir, &readiness)).expect_err("bad readiness");
     assert_eq!(error.code(), "ConfigInvalid");
+}
+
+#[test]
+fn config_mutation_posture_ambiguity_is_refused() {
+    let dir = temp_dir("cfg-posture");
+    // An allowlist while the posture is off.
+    let body = format!("mutation_allowlist = [\"alice\"]\n{VALID_SERVER}");
+    let error = Config::load(&write_config(&dir, &body)).expect_err("allowlist while off");
+    assert_eq!(error.code(), "ConfigInvalid");
+    // Gated with an explicitly empty allowlist.
+    let body = format!("mutation = \"gated\"\nmutation_allowlist = []\n{VALID_SERVER}");
+    let error = Config::load(&write_config(&dir, &body)).expect_err("gated with empty list");
+    assert_eq!(error.code(), "ConfigInvalid");
+    // Gated with a blank identity name.
+    let body = format!("mutation = \"gated\"\nmutation_allowlist = [\"  \"]\n{VALID_SERVER}");
+    let error = Config::load(&write_config(&dir, &body)).expect_err("gated with blank name");
+    assert_eq!(error.code(), "ConfigInvalid");
+    // An unknown posture string.
+    let body = format!("mutation = \"sometimes\"\n{VALID_SERVER}");
+    let error = Config::load(&write_config(&dir, &body)).expect_err("unknown posture");
+    assert_eq!(error.code(), "ConfigInvalid");
+}
+
+#[test]
+fn gate_decide_denies_each_check_independently() {
+    let allowlist = vec!["alice".to_string()];
+    let cases: Vec<(GateDecision, &str)> = vec![
+        (
+            decide(
+                MutationPosture::Off,
+                Some("alice"),
+                &allowlist,
+                HandleState::Valid,
+                VersionState::Current,
+            ),
+            "posture is off",
+        ),
+        (
+            decide(
+                MutationPosture::Gated,
+                None,
+                &allowlist,
+                HandleState::Valid,
+                VersionState::Current,
+            ),
+            "no client identity",
+        ),
+        (
+            decide(
+                MutationPosture::Gated,
+                Some("mallory"),
+                &allowlist,
+                HandleState::Valid,
+                VersionState::Current,
+            ),
+            "not on the mutation allowlist",
+        ),
+        (
+            decide(
+                MutationPosture::Gated,
+                Some("alice"),
+                &allowlist,
+                HandleState::Missing,
+                VersionState::Current,
+            ),
+            "unknown action handle",
+        ),
+        (
+            decide(
+                MutationPosture::Gated,
+                Some("alice"),
+                &allowlist,
+                HandleState::Used,
+                VersionState::Current,
+            ),
+            "single-use",
+        ),
+        (
+            decide(
+                MutationPosture::Gated,
+                Some("alice"),
+                &allowlist,
+                HandleState::WrongSession,
+                VersionState::Current,
+            ),
+            "different session",
+        ),
+        (
+            decide(
+                MutationPosture::Gated,
+                Some("alice"),
+                &allowlist,
+                HandleState::Valid,
+                VersionState::Drifted,
+            ),
+            "changed since",
+        ),
+    ];
+    for (decision, needle) in cases {
+        match decision {
+            GateDecision::Deny(reason) => {
+                assert!(
+                    reason.contains(needle),
+                    "reason {reason:?} lacks {needle:?}"
+                )
+            }
+            GateDecision::Allow => panic!("expected a denial mentioning {needle:?}"),
+        }
+    }
 }
 
 #[test]

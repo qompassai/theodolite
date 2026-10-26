@@ -32,10 +32,10 @@ pub enum BridgeError {
     ResultTooLarge { items: usize, budget_bytes: usize },
     /// A path or URI escapes the session workspace.
     WorkspaceEscape { detail: String },
-    /// A gated (mutation-class) operation was refused. In v1 the
-    /// mutation class is unimplemented and unregistered, so this is
-    /// only reachable through internal misuse; the code exists so the
-    /// taxonomy in SPEC §4.6 is complete from birth.
+    /// A gated (mutation-class) operation was refused by the
+    /// decide()-class gate (P5): posture, identity, handle validity,
+    /// or version state denied the apply. The decision and its
+    /// reason are recorded in the session transcript.
     GateDenied { detail: String },
     /// The closed method/tool set was asked for something outside it.
     UnsupportedMethod { detail: String },
