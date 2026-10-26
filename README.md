@@ -12,7 +12,7 @@ pinned server sessions and never touches an editor.
 Design authority: `~/workspace/lsp-mcp-study-20261025/SPEC.md`.
 Build record: `BUILD-REPORT.md` in this directory.
 
-## Surface (read-only; v1 + P3 read-class completion)
+## Surface (read class; v1 + P3 read-class completion)
 
 Tools: `session_status`, `diagnostics` (push accumulation merged
 with pull where the server advertises it, per-diagnostic channel
@@ -20,12 +20,63 @@ provenance), `hover`, `definition`, `declaration`,
 `type_definition`, `implementation`, `references`,
 `document_symbols`, `workspace_symbols`, `code_actions` (listing
 only — payloads never returned, never executed),
-`session_restart`. The mutation class is not registered at all;
-there is no generic any-LSP-method tool and no rename apply.
+`rename_preview`, `session_restart`. There is no generic
+any-LSP-method tool, no `edit_file`, no formatting tool, and no
+`workspace/executeCommand` passthrough — the surface stays a
+closed list by construction.
 
 Servers (config data, not code): bacon-ls (diagnostics owner),
 rust-analyzer (semantics), lua-language-server (second proof
 server).
+
+## Mutation class (P5; gated, off by default)
+
+Two further tools exist, registered only under the mutation
+gate: `code_action_apply` and `rename_apply`. `rename_preview`
+belongs to the read class — it computes and renders a rename's
+edit set and writes nothing; the gate does not govern it.
+
+- **Posture.** Config carries `mutation = "off"` (default) or
+  `mutation = "gated"` together with a non-empty
+  `mutation_allowlist` of client names. Any other combination —
+  unknown value, gated without an allowlist, an allowlist while
+  off — refuses to start with a typed `ConfigInvalid`; an
+  ambiguous posture never drifts on silently.
+- **Identity and registration.** The gate's identity is the MCP
+  handshake's `clientInfo.name` — a routing label inside the
+  host's trust boundary (SPEC §8), not an authentication layer.
+  Only when the posture is gated AND the connected client is
+  allowlisted do the two apply tools appear in `tools/list`;
+  under every other combination they are absent, and calling
+  one answers `UnsupportedMethod`. A gated config with no
+  handshake identity fails closed.
+- **Decisions.** Every apply is decided by a pure function
+  (`gate::decide`) over posture, identity, allowlist, handle
+  state, and version state. Every decision — allow or deny, with
+  its reason — is recorded in the session transcript
+  (`session_status` → `gate_decisions`, metadata only, bounded).
+- **Handles.** `code_actions` mints an opaque single-use handle
+  for each edit-carrying action, only while the apply class is
+  registered for the client. The edit body and a listing-time
+  SHA-256 snapshot of every target stay server-side; listings
+  still never carry payloads. `code_action_apply` takes a handle
+  only — a caller-supplied edit is a typed refusal. At apply
+  time a forged, spent, cross-session, or version-drifted handle
+  is a typed `GateDenied`, logged. An allowed apply consumes the
+  handle before writing, so a spent handle never retries.
+- **`rename_apply`** takes the preview's arguments, not a
+  handle: it recomputes fresh, re-validates every tracked
+  document's hash between compute and write (drift refuses the
+  whole rename, nothing written), and answers `applied: true`
+  where the preview answers `applied: false`.
+- **The applier** is the bridge's only write path. It validates
+  the whole set before writing anything (workspace boundary on
+  every target, existence, UTF-8, span bounds, overlap), then
+  writes per file atomically — temp sibling + rename, original
+  permissions preserved — and re-syncs touched files. File
+  create / rename / delete operations are typed refusals
+  everywhere: the bridge edits file *contents* only, and a
+  `workspace/applyEdit` pushed by a server is never honored.
 
 ## Run
 

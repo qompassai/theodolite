@@ -9,7 +9,16 @@
 # request_timeout_ms = 60000
 # ready_timeout_ms = 30000
 # shutdown_grace_ms = 2000
+#
+# Mutation posture (P5): "off" (default) registers no apply tools.
+# "gated" registers code_action_apply / rename_apply ONLY for MCP
+# clients whose handshake clientInfo.name appears in
+# mutation_allowlist. gated requires a non-empty allowlist, and an
+# allowlist while off is refused at startup — an ambiguous posture
+# is a typed ConfigInvalid, never a silent default.
 mutation = "off"
+# mutation = "gated"
+# mutation_allowlist = ["my-agent"]
 
 [[server]]
 id = "bacon-ls"
