@@ -384,6 +384,36 @@ fn double_run_is_byte_identical() {
 }
 
 #[test]
+fn definition_family_tools_shape_and_sort() {
+    let dir = temp_dir("family");
+    let ws = make_workspace(&dir);
+    let config = write_fake_config(&dir, "rich", "", &[]);
+    let mut bridge = Bridge::spawn(&config);
+    // declaration: the fake answers a bare Location object.
+    let (is_error, result) = bridge.call_tool("declaration", hover_args(&ws));
+    assert!(!is_error, "{result}");
+    assert_eq!(result["count"], 1);
+    assert_eq!(result["locations"][0]["uri"], "file:///src/lib.rs");
+    assert_eq!(result["locations"][0]["range"]["start"]["line"], 1);
+    // type_definition: the fake answers a LocationLink; the shaped
+    // range is the target *selection* range (line 2, chars 4..9),
+    // not the broader target range.
+    let (is_error, result) = bridge.call_tool("type_definition", hover_args(&ws));
+    assert!(!is_error, "{result}");
+    assert_eq!(result["count"], 1);
+    assert_eq!(result["locations"][0]["range"]["start"]["line"], 2);
+    assert_eq!(result["locations"][0]["range"]["start"]["character"], 4);
+    assert_eq!(result["locations"][0]["range"]["end"]["character"], 9);
+    // implementation: scrambled order is canonicalized.
+    let (is_error, result) = bridge.call_tool("implementation", hover_args(&ws));
+    assert!(!is_error, "{result}");
+    assert_eq!(result["count"], 2);
+    assert_eq!(result["locations"][0]["uri"], "file:///src/lib.rs");
+    assert_eq!(result["locations"][1]["uri"], "file:///src/other.rs");
+    bridge.shutdown();
+}
+
+#[test]
 fn session_restart_returns_a_fresh_transcript() {
     let dir = temp_dir("restart-ok");
     let ws = make_workspace(&dir);
@@ -684,6 +714,9 @@ fn mutation_tools_are_absent_and_unregistered() {
             "diagnostics",
             "hover",
             "definition",
+            "declaration",
+            "type_definition",
+            "implementation",
             "references",
             "document_symbols",
             "session_restart"
@@ -760,6 +793,25 @@ fn fifth_session_key_is_a_loud_error_not_an_eviction() {
     let (is_error, result) = bridge.call_tool("hover", hover_args(&workspaces[4]));
     assert!(is_error, "{result}");
     assert_eq!(Bridge::error_code(&result), "SessionLimit");
+    bridge.shutdown();
+}
+
+#[test]
+fn definition_family_unsupported_is_typed_not_empty() {
+    let dir = temp_dir("family-unsupported");
+    let ws = make_workspace(&dir);
+    // The normal fake advertises no providers at all.
+    let config = write_fake_config(&dir, "normal", "", &[]);
+    let mut bridge = Bridge::spawn(&config);
+    for tool in ["declaration", "type_definition", "implementation"] {
+        let (is_error, result) = bridge.call_tool(tool, hover_args(&ws));
+        assert!(is_error, "{tool} unexpectedly succeeded: {result}");
+        assert_eq!(
+            Bridge::error_code(&result),
+            "UnsupportedMethod",
+            "{tool}: {result}"
+        );
+    }
     bridge.shutdown();
 }
 

@@ -127,6 +127,13 @@ impl Fake {
                             "workspaceDiagnostics": false
                         }
                     }),
+                    "rich" => serde_json::json!({
+                        "declarationProvider": true,
+                        "typeDefinitionProvider": true,
+                        "implementationProvider": true,
+                        "workspaceSymbolProvider": true,
+                        "codeActionProvider": true
+                    }),
                     _ => serde_json::json!({}),
                 };
                 respond(
@@ -227,6 +234,47 @@ impl Fake {
                     serde_json::json!([
                         {"uri": format!("{root}/src/other.rs"), "range": range(5, 0, 5, 3)},
                         {"uri": format!("{root}/src/lib.rs"), "range": range(2, 0, 2, 3)}
+                    ]),
+                );
+                true
+            }
+            "textDocument/declaration" => {
+                // Single Location object (not an array): the bridge
+                // must normalize all three LSP result shapes.
+                let root = self.root_uri.clone();
+                respond(
+                    writer,
+                    id,
+                    serde_json::json!({
+                        "uri": format!("{root}/src/lib.rs"), "range": range(1, 0, 1, 3)
+                    }),
+                );
+                true
+            }
+            "textDocument/typeDefinition" => {
+                // LocationLink shape: the bridge must land on
+                // targetSelectionRange, not targetRange.
+                let root = self.root_uri.clone();
+                respond(
+                    writer,
+                    id,
+                    serde_json::json!([{
+                        "originSelectionRange": range(6, 6, 6, 10),
+                        "targetUri": format!("{root}/src/lib.rs"),
+                        "targetRange": range(2, 0, 4, 1),
+                        "targetSelectionRange": range(2, 4, 2, 9)
+                    }]),
+                );
+                true
+            }
+            "textDocument/implementation" => {
+                let root = self.root_uri.clone();
+                respond(
+                    writer,
+                    id,
+                    serde_json::json!([
+                        {"uri": format!("{root}/src/other.rs"), "range": range(5, 0, 5, 3)},
+                        {"uri": format!("{root}/src/lib.rs"), "range": range(3, 0, 3, 3)}
                     ]),
                 );
                 true

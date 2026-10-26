@@ -17,12 +17,15 @@ use crate::shaping::{
     sort_locations, uri_to_path,
 };
 
-/// Tool names registered in v1, in registration order.
-pub const TOOL_NAMES: [&str; 7] = [
+/// Tool names registered, in registration order.
+pub const TOOL_NAMES: [&str; 10] = [
     "session_status",
     "diagnostics",
     "hover",
     "definition",
+    "declaration",
+    "type_definition",
+    "implementation",
     "references",
     "document_symbols",
     "session_restart",
@@ -97,6 +100,27 @@ pub fn tool_definitions() -> serde_json::Value {
             &["workspace", "server", "path", "line", "character"],
         ),
         tool(
+            "declaration",
+            "Declaration of the symbol at a position, as a sorted location list. \
+             Typed UnsupportedMethod when the server does not advertise declaration support.",
+            position_props(false),
+            &["workspace", "server", "path", "line", "character"],
+        ),
+        tool(
+            "type_definition",
+            "Type definition of the symbol at a position, as a sorted location list. \
+             Typed UnsupportedMethod when the server does not advertise type-definition support.",
+            position_props(false),
+            &["workspace", "server", "path", "line", "character"],
+        ),
+        tool(
+            "implementation",
+            "Implementations of the symbol at a position, as a sorted location list. \
+             Typed UnsupportedMethod when the server does not advertise implementation support.",
+            position_props(false),
+            &["workspace", "server", "path", "line", "character"],
+        ),
+        tool(
             "references",
             "References to the symbol at a position, as a sorted location list.",
             position_props(true),
@@ -129,6 +153,13 @@ pub fn call_tool(
         "diagnostics" => tool_diagnostics(manager, arguments),
         "hover" => tool_hover(manager, arguments),
         "definition" => tool_definition(manager, arguments),
+        "declaration" => definition_family_tool(manager, arguments, FamilyMember::Declaration),
+        "type_definition" => {
+            definition_family_tool(manager, arguments, FamilyMember::TypeDefinition)
+        }
+        "implementation" => {
+            definition_family_tool(manager, arguments, FamilyMember::Implementation)
+        }
         "references" => tool_references(manager, arguments),
         "document_symbols" => tool_document_symbols(manager, arguments),
         "session_restart" => tool_session_restart(manager, arguments),
@@ -403,6 +434,61 @@ fn tool_definition(
     let (session, params) = position_params(manager, arguments)?;
     let raw = session.request(
         "textDocument/definition",
+        params,
+        manager.config().request_timeout_ms,
+    )?;
+    shape_location_result(&session, &raw)
+}
+
+/// The definition family beyond `definition` itself (SPEC §6:
+/// separate tools, not merged). Each member shares `definition`'s
+/// shaping exactly and is gated on the server's advertised provider:
+/// an unadvertised member is a typed `UnsupportedMethod`, never a
+/// silent empty list (an empty list from an advertising server is a
+/// real answer and stays one).
+#[derive(Debug, Clone, Copy)]
+enum FamilyMember {
+    Declaration,
+    TypeDefinition,
+    Implementation,
+}
+
+impl FamilyMember {
+    fn method(&self) -> &'static str {
+        match self {
+            FamilyMember::Declaration => "textDocument/declaration",
+            FamilyMember::TypeDefinition => "textDocument/typeDefinition",
+            FamilyMember::Implementation => "textDocument/implementation",
+        }
+    }
+
+    fn capability(&self) -> &'static str {
+        match self {
+            FamilyMember::Declaration => "declarationProvider",
+            FamilyMember::TypeDefinition => "typeDefinitionProvider",
+            FamilyMember::Implementation => "implementationProvider",
+        }
+    }
+}
+
+fn definition_family_tool(
+    manager: &SessionManager,
+    arguments: &serde_json::Value,
+    member: FamilyMember,
+) -> BridgeResult<serde_json::Value> {
+    let (session, params) = position_params(manager, arguments)?;
+    if !session.capability_advertised(member.capability()) {
+        return Err(BridgeError::UnsupportedMethod {
+            detail: format!(
+                "server {} does not advertise {}; {} is unavailable, not empty",
+                session.entry.id,
+                member.capability(),
+                member.method()
+            ),
+        });
+    }
+    let raw = session.request(
+        member.method(),
         params,
         manager.config().request_timeout_ms,
     )?;
