@@ -1,0 +1,262 @@
+//! Library-level gates: config validation, bounded framing, and
+//! canonical shaping. Split between validation and adversarial
+//! cases; the classification of every test is listed in
+//! BUILD-REPORT.md.
+
+use std::io::Cursor;
+use std::path::{Path, PathBuf};
+
+use theodolite::config::Config;
+use theodolite::errors::BridgeError;
+use theodolite::lsp::{LspMessage, read_message, write_message};
+use theodolite::session::resolve_within;
+use theodolite::shaping::{
+    Diagnostic, Location, Position, Range, enforce_budget, relativize_uri, sort_diagnostics,
+    sort_locations, uri_to_path,
+};
+
+fn temp_dir(tag: &str) -> PathBuf {
+    let dir = std::env::temp_dir().join(format!("theodolite-unit-{tag}-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).expect("create temp dir");
+    dir
+}
+
+fn write_config(dir: &Path, body: &str) -> PathBuf {
+    let path = dir.join("bridge.toml");
+    std::fs::write(&path, body).expect("write config");
+    path
+}
+
+const VALID_SERVER: &str = r#"
+[[server]]
+id = "fake"
+binary = "/bin/true"
+version_probe = ["--version"]
+expect_version = "true 1.0"
+languages = ["rust"]
+extensions = ["rs"]
+readiness = "immediate"
+"#;
+
+// --- Validation ----------------------------------------------------
+
+#[test]
+fn config_valid_loads_with_positional_language_pairing() {
+    let dir = temp_dir("cfg-ok");
+    let path = write_config(&dir, VALID_SERVER);
+    let config = Config::load(&path).expect("valid config loads");
+    assert_eq!(config.servers.len(), 1);
+    assert_eq!(
+        config.servers[0].language_ids.get("rs").map(String::as_str),
+        Some("rust")
+    );
+    assert_eq!(config.config_hash.len(), 64);
+    assert_eq!(config.mutation, "off");
+}
+
+#[test]
+fn framing_roundtrip_classifies_all_three_shapes() {
+    let mut buffer: Vec<u8> = Vec::new();
+    write_message(
+        &mut buffer,
+        "srv",
+        &serde_json::json!({"jsonrpc": "2.0", "id": 7, "result": {"ok": true}}),
+    )
+    .expect("write response");
+    write_message(
+        &mut buffer,
+        "srv",
+        &serde_json::json!({"jsonrpc": "2.0", "method": "m/n", "params": {}}),
+    )
+    .expect("write notification");
+    write_message(
+        &mut buffer,
+        "srv",
+        &serde_json::json!({"jsonrpc": "2.0", "id": 9, "method": "m/r", "params": {}}),
+    )
+    .expect("write request");
+    let mut cursor = Cursor::new(buffer);
+    match read_message(&mut cursor, "srv")
+        .expect("read response")
+        .expect("frame")
+    {
+        LspMessage::Response { id, result } => {
+            assert_eq!(id, 7);
+            assert!(result.is_ok());
+        }
+        other => panic!("expected response, got {other:?}"),
+    }
+    match read_message(&mut cursor, "srv")
+        .expect("read notification")
+        .expect("frame")
+    {
+        LspMessage::Notification { method, .. } => assert_eq!(method, "m/n"),
+        other => panic!("expected notification, got {other:?}"),
+    }
+    match read_message(&mut cursor, "srv")
+        .expect("read request")
+        .expect("frame")
+    {
+        LspMessage::Request { method, .. } => assert_eq!(method, "m/r"),
+        other => panic!("expected request, got {other:?}"),
+    }
+}
+
+#[test]
+fn shaping_sorts_canonically_and_dedups_locations() {
+    let range = |line: u64| Range {
+        start: Position { line, character: 0 },
+        end: Position { line, character: 3 },
+    };
+    let mut diagnostics = vec![
+        Diagnostic {
+            uri: "file:///b.rs".into(),
+            range: range(1),
+            severity: 1,
+            source: "clippy".into(),
+            code: "x".into(),
+            message: "m".into(),
+        },
+        Diagnostic {
+            uri: "file:///a.rs".into(),
+            range: range(9),
+            severity: 2,
+            source: "clippy".into(),
+            code: "x".into(),
+            message: "m".into(),
+        },
+        Diagnostic {
+            uri: "file:///a.rs".into(),
+            range: range(2),
+            severity: 2,
+            source: "clippy".into(),
+            code: "x".into(),
+            message: "m".into(),
+        },
+    ];
+    sort_diagnostics(&mut diagnostics);
+    assert_eq!(diagnostics[0].uri, "file:///a.rs");
+    assert_eq!(diagnostics[0].range.start.line, 2);
+    assert_eq!(diagnostics[2].uri, "file:///b.rs");
+
+    let mut locations = vec![
+        Location {
+            uri: "file:///a.rs".into(),
+            range: range(5),
+        },
+        Location {
+            uri: "file:///a.rs".into(),
+            range: range(5),
+        },
+        Location {
+            uri: "file:///a.rs".into(),
+            range: range(1),
+        },
+    ];
+    sort_locations(&mut locations);
+    assert_eq!(locations.len(), 2);
+    assert_eq!(locations[0].range.start.line, 1);
+}
+
+#[test]
+fn uri_codec_roundtrips_and_relativizes() {
+    let path = uri_to_path("file:///tmp/some%20dir/a.rs").expect("decode");
+    assert_eq!(path, PathBuf::from("/tmp/some dir/a.rs"));
+    let root = PathBuf::from("/tmp/some dir");
+    let relative = relativize_uri("file:///tmp/some%20dir/a.rs", &root).expect("relativize");
+    assert_eq!(relative, "file:///a.rs");
+}
+
+// --- Adversarial ---------------------------------------------------
+
+#[test]
+fn config_violations_are_typed_config_invalid() {
+    let dir = temp_dir("cfg-bad");
+    // Relative binary path.
+    let bad = VALID_SERVER.replace("/bin/true", "relative/true");
+    let error = Config::load(&write_config(&dir, &bad)).expect_err("relative binary refused");
+    assert_eq!(error.code(), "ConfigInvalid");
+    // Duplicate server id.
+    let dup = format!("{VALID_SERVER}\n{VALID_SERVER}");
+    let error = Config::load(&write_config(&dir, &dup)).expect_err("duplicate id refused");
+    assert_eq!(error.code(), "ConfigInvalid");
+    // Mutation posture other than off.
+    let gated = format!("mutation = \"gated\"\n{VALID_SERVER}");
+    let error = Config::load(&write_config(&dir, &gated)).expect_err("mutation refused in v1");
+    assert_eq!(error.code(), "ConfigInvalid");
+    // Unknown readiness predicate.
+    let readiness = VALID_SERVER.replace("immediate", "whenever");
+    let error = Config::load(&write_config(&dir, &readiness)).expect_err("bad readiness");
+    assert_eq!(error.code(), "ConfigInvalid");
+}
+
+#[test]
+fn framing_rejects_oversized_negative_and_garbage_before_allocation() {
+    // Oversized: only the header exists in the stream. If the reader
+    // tried to allocate or read the body first, the error would be a
+    // truncation error instead of the cap error.
+    let mut cursor = Cursor::new(b"Content-Length: 99999999\r\n\r\n".to_vec());
+    let error = read_message(&mut cursor, "srv").expect_err("oversized refused");
+    assert_eq!(error.code(), "MalformedServerTraffic");
+    assert!(error.to_string().contains("MAX_FRAME_BYTES"), "{error}");
+
+    let mut cursor = Cursor::new(b"Content-Length: -5\r\n\r\n".to_vec());
+    let error = read_message(&mut cursor, "srv").expect_err("negative refused");
+    assert_eq!(error.code(), "MalformedServerTraffic");
+
+    let body = b"not json";
+    let mut frame = format!("Content-Length: {}\r\n\r\n", body.len()).into_bytes();
+    frame.extend_from_slice(body);
+    let mut cursor = Cursor::new(frame);
+    let error = read_message(&mut cursor, "srv").expect_err("garbage refused");
+    assert_eq!(error.code(), "MalformedServerTraffic");
+}
+
+#[test]
+fn budget_overflow_is_typed_with_true_item_count() {
+    let big = serde_json::json!({"items": "x".repeat(5000)});
+    let error = enforce_budget(&big, 42, 1024).expect_err("over budget");
+    match error {
+        BridgeError::ResultTooLarge {
+            items,
+            budget_bytes,
+        } => {
+            assert_eq!(items, 42);
+            assert_eq!(budget_bytes, 1024);
+        }
+        other => panic!("expected ResultTooLarge, got {other:?}"),
+    }
+}
+
+#[test]
+fn path_escapes_are_refused_in_all_forms() {
+    let dir = temp_dir("escape");
+    let workspace = dir.join("ws");
+    std::fs::create_dir_all(&workspace).expect("mkdir ws");
+    std::fs::write(workspace.join("inside.rs"), "fn main() {}\n").expect("write inside");
+    let outside = dir.join("outside.rs");
+    std::fs::write(&outside, "fn secret() {}\n").expect("write outside");
+    let root = workspace.canonicalize().expect("canonical ws");
+
+    // Textual traversal.
+    let error = resolve_within(&root, "../outside.rs").expect_err("dotdot refused");
+    assert_eq!(error.code(), "WorkspaceEscape");
+    // Absolute path outside the workspace.
+    let error =
+        resolve_within(&root, outside.to_str().expect("utf8")).expect_err("absolute refused");
+    assert_eq!(error.code(), "WorkspaceEscape");
+    // Symlink inside the workspace pointing out.
+    std::os::unix::fs::symlink(&outside, workspace.join("link.rs")).expect("symlink");
+    let error = resolve_within(&root, "link.rs").expect_err("symlink escape refused");
+    assert_eq!(error.code(), "WorkspaceEscape");
+    // Non-file URI scheme.
+    let error = uri_to_path("https://example.com/a.rs").expect_err("scheme refused");
+    assert_eq!(error.code(), "WorkspaceEscape");
+    // A URI outside the workspace cannot be relativized into a result.
+    let error = relativize_uri("file:///etc/passwd", &root).expect_err("outside uri refused");
+    assert_eq!(error.code(), "WorkspaceEscape");
+    // The legitimate inside path resolves.
+    let ok = resolve_within(&root, "inside.rs").expect("inside resolves");
+    assert!(ok.ends_with("inside.rs"));
+}
