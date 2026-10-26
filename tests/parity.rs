@@ -18,7 +18,9 @@ use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
 use std::time::{Duration, Instant};
 
 use theodolite::lsp::{LspMessage, read_message, write_message};
-use theodolite::shaping::{Diagnostic, diagnostic_json, parse_range, sort_diagnostics};
+use theodolite::shaping::{
+    Diagnostic, DiagnosticChannel, diagnostic_json, parse_range, sort_diagnostics,
+};
 
 const FIXTURE_LIB: &str = r#"pub fn used() -> u32 {
     1
@@ -221,6 +223,7 @@ impl DirectClient {
                         .and_then(serde_json::Value::as_str)
                         .unwrap_or_default()
                         .to_string(),
+                    channel: DiagnosticChannel::Push,
                 });
             }
             self.generation += 1;

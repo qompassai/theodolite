@@ -38,6 +38,40 @@ pub struct Location {
     pub range: Range,
 }
 
+/// The channel a diagnostic arrived through (P3 pull merge). A
+/// diagnostic the server reports identically over both channels is
+/// deduplicated to one entry whose channel is `PushAndPull` — the
+/// provenance is part of the shaped result, per the P3 brief.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DiagnosticChannel {
+    /// Arrived via `textDocument/publishDiagnostics` only.
+    Push,
+    /// Arrived via a `textDocument/diagnostic` pull only.
+    Pull,
+    /// Reported identically over both channels.
+    PushAndPull,
+}
+
+impl DiagnosticChannel {
+    /// The wire string for this channel.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            DiagnosticChannel::Push => "push",
+            DiagnosticChannel::Pull => "pull",
+            DiagnosticChannel::PushAndPull => "push+pull",
+        }
+    }
+
+    /// Combine two provenances for the same diagnostic identity.
+    pub fn combine(self, other: DiagnosticChannel) -> DiagnosticChannel {
+        if self == other {
+            self
+        } else {
+            DiagnosticChannel::PushAndPull
+        }
+    }
+}
+
 /// One diagnostic, normalized from either push or pull sources.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Diagnostic {
@@ -53,6 +87,74 @@ pub struct Diagnostic {
     pub code: String,
     /// Human message, verbatim.
     pub message: String,
+    /// Channel provenance (push / pull / push+pull).
+    pub channel: DiagnosticChannel,
+}
+
+/// Normalize raw LSP diagnostic items for one document into bridge
+/// diagnostics carrying `channel` provenance. The one normalization
+/// both the push accumulator and the pull path use, so the two
+/// channels can never drift into different shapings of the same
+/// server fact.
+pub fn diagnostics_from_lsp(
+    uri: &str,
+    items: &[serde_json::Value],
+    channel: DiagnosticChannel,
+) -> Vec<Diagnostic> {
+    items
+        .iter()
+        .map(|item| Diagnostic {
+            uri: uri.to_string(),
+            range: parse_range(item.get("range").unwrap_or(&serde_json::Value::Null)),
+            severity: item
+                .get("severity")
+                .and_then(serde_json::Value::as_u64)
+                .unwrap_or(0),
+            source: item
+                .get("source")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or_default()
+                .to_string(),
+            code: match item.get("code") {
+                Some(serde_json::Value::String(text)) => text.clone(),
+                Some(serde_json::Value::Number(number)) => number.to_string(),
+                _ => String::new(),
+            },
+            message: item
+                .get("message")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or_default()
+                .to_string(),
+            channel,
+        })
+        .collect()
+}
+
+/// Merge a push set and a pull set into one canonical set: entries
+/// with the same diagnostic identity (everything but the channel)
+/// collapse to one entry with combined provenance (SPEC §4.3 sorts
+/// afterwards; identity uses the same fields the sort key uses).
+pub fn merge_diagnostics(
+    push: Vec<Diagnostic>,
+    pull: Vec<Diagnostic>,
+) -> Vec<Diagnostic> {
+    let mut merged: Vec<Diagnostic> = Vec::with_capacity(push.len() + pull.len());
+    for candidate in push.into_iter().chain(pull) {
+        match merged.iter_mut().find(|existing| {
+            existing.uri == candidate.uri
+                && existing.range == candidate.range
+                && existing.severity == candidate.severity
+                && existing.source == candidate.source
+                && existing.code == candidate.code
+                && existing.message == candidate.message
+        }) {
+            Some(existing) => {
+                existing.channel = existing.channel.combine(candidate.channel);
+            }
+            None => merged.push(candidate),
+        }
+    }
+    merged
 }
 
 /// Parse an LSP range object; missing fields default to zero so a
@@ -113,7 +215,28 @@ pub fn diagnostic_json(diagnostic: &Diagnostic) -> serde_json::Value {
         "source": diagnostic.source,
         "code": diagnostic.code,
         "message": diagnostic.message,
+        "channel": diagnostic.channel.as_str(),
     })
+}
+
+/// Render one diagnostic back into the LSP wire shape. Used where
+/// the protocol itself consumes diagnostics (the `context` of a
+/// `textDocument/codeAction` request) — the inverse of
+/// `diagnostics_from_lsp`, minus the channel, which is bridge
+/// metadata and never goes back on the wire.
+pub fn diagnostic_to_lsp(diagnostic: &Diagnostic) -> serde_json::Value {
+    let mut item = serde_json::json!({
+        "range": range_json(diagnostic.range),
+        "severity": diagnostic.severity,
+        "message": diagnostic.message,
+    });
+    if !diagnostic.source.is_empty() {
+        item["source"] = serde_json::Value::String(diagnostic.source.clone());
+    }
+    if !diagnostic.code.is_empty() {
+        item["code"] = serde_json::Value::String(diagnostic.code.clone());
+    }
+    item
 }
 
 /// Sort locations by their SPEC §4.3 key and drop exact duplicates.

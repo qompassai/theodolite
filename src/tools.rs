@@ -13,7 +13,8 @@ use crate::errors::{BridgeError, BridgeResult};
 use crate::session::{Session, SessionManager, resolve_within, validate_workspace};
 use crate::shaping::{
     Diagnostic, Location, MAX_RESULT_BYTES, diagnostic_json, enforce_budget, location_json,
-    parse_range, path_to_uri, range_json, relativize_uri, sort_diagnostics, sort_locations,
+    merge_diagnostics, parse_range, path_to_uri, range_json, relativize_uri, sort_diagnostics,
+    sort_locations, uri_to_path,
 };
 
 /// Tool names registered in v1, in registration order.
@@ -240,6 +241,49 @@ fn tool_diagnostics(
         None => None,
     };
     let mut diagnostics = session.diagnostics(manager.config(), only_uri.as_deref())?;
+    // P3 item 1: when the server advertises pull diagnostics, merge
+    // the pull set with the accumulated push set. The merge is
+    // protocol-shaped (advertisement-driven), never server-shaped:
+    // servers without `diagnosticProvider` behave exactly as v1.
+    // The pull scope is the `path`-scoped document, or — unscoped —
+    // every document the push set names plus every document the
+    // bridge has open.
+    let mut channels: Vec<&str> = vec!["push"];
+    if session.supports_pull_diagnostics() {
+        let scope_uris: Vec<String> = match &only_uri {
+            Some(uri) => vec![uri.clone()],
+            None => {
+                let mut uris: Vec<String> = diagnostics
+                    .iter()
+                    .map(|diagnostic| diagnostic.uri.clone())
+                    .chain(session.open_document_uris())
+                    .collect();
+                uris.sort();
+                uris.dedup();
+                uris
+            }
+        };
+        let mut pulled: Vec<Diagnostic> = Vec::new();
+        for uri in &scope_uris {
+            // A pull needs the document open. Sync it in when it is a
+            // real file inside this workspace; a push URI that names
+            // no syncable file keeps its push entries and is simply
+            // not pulled (its push set above is unaffected).
+            let synced = match uri_to_path(uri) {
+                Ok(path) if path.starts_with(&session.workspace_root) => {
+                    session.sync_file(&path).is_ok()
+                }
+                _ => false,
+            };
+            if !synced {
+                continue;
+            }
+            pulled.extend(session.pull_diagnostics(manager.config(), uri)?);
+        }
+        diagnostics = merge_diagnostics(diagnostics, pulled);
+        channels.push("pull");
+        channels.sort_unstable();
+    }
     // Relativize URIs into the workspace-relative result form; a URI
     // outside the workspace in a result is a WorkspaceEscape (§9.9).
     let mut shaped: Vec<Diagnostic> = Vec::with_capacity(diagnostics.len());
@@ -255,6 +299,7 @@ fn tool_diagnostics(
     let mut result = serde_json::json!({
         "server": server_id,
         "diagnostics_source": server_id,
+        "channels": channels,
         "count": items.len(),
         "diagnostics": items,
     });

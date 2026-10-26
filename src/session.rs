@@ -20,7 +20,7 @@ use std::time::{Duration, Instant};
 use crate::config::{Config, Readiness, ServerEntry, sha256_hex};
 use crate::errors::{BridgeError, BridgeResult, io_error};
 use crate::lsp::{LspMessage, read_message, write_message};
-use crate::shaping::{Diagnostic, parse_range};
+use crate::shaping::{Diagnostic, DiagnosticChannel, diagnostics_from_lsp};
 
 /// Maximum concurrent sessions per bridge process (SPEC §3.2).
 pub const MAX_SESSIONS: usize = 4;
@@ -71,6 +71,11 @@ struct Inner {
     /// bridges lose).
     saw_activity: bool,
     documents: HashMap<String, OpenDocument>,
+    /// The server's advertised capabilities, captured verbatim from
+    /// the `initialize` result (P3). Feature support is read from
+    /// this, never probed by trial request: an unadvertised feature
+    /// is a typed `UnsupportedMethod`, not a server error.
+    server_capabilities: serde_json::Value,
     stderr_ring: VecDeque<u8>,
     exit_status: Option<String>,
     protocol_violations: u64,
@@ -98,6 +103,7 @@ impl SessionState {
                 server_status_quiescent: None,
                 saw_activity: false,
                 documents: HashMap::new(),
+                server_capabilities: serde_json::Value::Null,
                 stderr_ring: VecDeque::new(),
                 exit_status: None,
                 protocol_violations: 0,
@@ -224,11 +230,24 @@ impl Session {
                 "textDocument": {
                     "synchronization": {"didSave": false},
                     "publishDiagnostics": {"relatedInformation": false},
+                    "diagnostic": {"dynamicRegistration": false},
                     "hover": {"contentFormat": ["markdown", "plaintext"]},
                     "definition": {},
+                    "declaration": {},
                     "references": {},
-                    "documentSymbol": {"hierarchicalDocumentSymbolSupport": true}
+                    "typeDefinition": {},
+                    "implementation": {},
+                    "documentSymbol": {"hierarchicalDocumentSymbolSupport": true},
+                    "codeAction": {
+                        "dynamicRegistration": false,
+                        "codeActionLiteralSupport": {"codeActionKind": {"valueSet": [
+                            "", "quickfix", "refactor", "refactor.extract",
+                            "refactor.inline", "refactor.rewrite", "source",
+                            "source.organizeImports"
+                        ]}}
+                    }
                 },
+                "workspace": {"symbol": {}},
                 "window": {"workDoneProgress": true},
                 "experimental": {"serverStatusNotification": true}
             },
@@ -238,7 +257,10 @@ impl Session {
         if let Some(options) = &self.entry.initialization_options {
             params["initializationOptions"] = options.clone();
         }
-        self.request("initialize", params, config.request_timeout_ms)?;
+        let initialize_result = self.request("initialize", params, config.request_timeout_ms)?;
+        if let Some(capabilities) = initialize_result.get("capabilities") {
+            self.state.lock().server_capabilities = capabilities.clone();
+        }
         // The `initialized` notification is best-effort at start: if
         // the child died immediately after answering initialize
         // (truncated/garbage fixtures do exactly this), the write
@@ -515,6 +537,59 @@ impl Session {
             collected.extend(diagnostics.iter().cloned());
         }
         Ok(collected)
+    }
+
+    /// Whether the server advertised a capability in its
+    /// `initialize` result. Boolean `false` and absence both mean
+    /// unadvertised; an options object or `true` means advertised.
+    pub fn capability_advertised(&self, capability: &str) -> bool {
+        match self.state.lock().server_capabilities.get(capability) {
+            Some(serde_json::Value::Bool(flag)) => *flag,
+            Some(serde_json::Value::Null) | None => false,
+            Some(_) => true,
+        }
+    }
+
+    /// Whether the server offers pull diagnostics
+    /// (`textDocument/diagnostic`, advertised as `diagnosticProvider`).
+    pub fn supports_pull_diagnostics(&self) -> bool {
+        self.capability_advertised("diagnosticProvider")
+    }
+
+    /// URIs of the documents the bridge currently has open, sorted
+    /// for deterministic iteration (pull scope, P3).
+    pub fn open_document_uris(&self) -> Vec<String> {
+        let inner = self.state.lock();
+        let mut uris: Vec<String> = inner.documents.keys().cloned().collect();
+        uris.sort();
+        uris
+    }
+
+    /// Pull diagnostics for one document (`textDocument/diagnostic`).
+    /// Only call when `supports_pull_diagnostics` holds. The bridge
+    /// keeps no `resultId`, so every pull asks for a full report; an
+    /// `unchanged` report (which a conforming server only sends
+    /// against a `previousResultId` the bridge never supplied)
+    /// normalizes to an empty set.
+    pub fn pull_diagnostics(
+        &self,
+        config: &Config,
+        uri: &str,
+    ) -> BridgeResult<Vec<Diagnostic>> {
+        let raw = self.request(
+            "textDocument/diagnostic",
+            serde_json::json!({"textDocument": {"uri": uri}}),
+            config.request_timeout_ms,
+        )?;
+        if raw.get("kind").and_then(serde_json::Value::as_str) == Some("unchanged") {
+            return Ok(Vec::new());
+        }
+        let items = raw
+            .get("items")
+            .and_then(serde_json::Value::as_array)
+            .cloned()
+            .unwrap_or_default();
+        Ok(diagnostics_from_lsp(uri, &items, DiagnosticChannel::Pull))
     }
 
     fn wait_diagnostics_settled(&self, config: &Config) -> BridgeResult<()> {
@@ -1003,32 +1078,7 @@ fn handle_notification(state: &Arc<SessionState>, method: &str, params: &serde_j
                 .and_then(serde_json::Value::as_array)
                 .cloned()
                 .unwrap_or_default();
-            let normalized: Vec<Diagnostic> = items
-                .iter()
-                .map(|item| Diagnostic {
-                    uri: uri.to_string(),
-                    range: parse_range(item.get("range").unwrap_or(&serde_json::Value::Null)),
-                    severity: item
-                        .get("severity")
-                        .and_then(serde_json::Value::as_u64)
-                        .unwrap_or(0),
-                    source: item
-                        .get("source")
-                        .and_then(serde_json::Value::as_str)
-                        .unwrap_or_default()
-                        .to_string(),
-                    code: match item.get("code") {
-                        Some(serde_json::Value::String(text)) => text.clone(),
-                        Some(serde_json::Value::Number(number)) => number.to_string(),
-                        _ => String::new(),
-                    },
-                    message: item
-                        .get("message")
-                        .and_then(serde_json::Value::as_str)
-                        .unwrap_or_default()
-                        .to_string(),
-                })
-                .collect();
+            let normalized = diagnostics_from_lsp(uri, &items, DiagnosticChannel::Push);
             let mut inner = state.lock();
             inner.diagnostics.insert(uri.to_string(), normalized);
             inner.diagnostics_generation += 1;

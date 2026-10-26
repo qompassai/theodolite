@@ -12,7 +12,12 @@
 //! `truncated` (short body then EOF), `unknown-id` (sends a response
 //! with an id the bridge never minted), `applyedit` (pushes a
 //! `workspace/applyEdit` request after didOpen and logs the bridge's
-//! refusal to `$FAKE_LSP_STATE_FILE`).
+//! refusal to `$FAKE_LSP_STATE_FILE`), `pull` (advertises
+//! `diagnosticProvider`; pushes a two-item set on didOpen and answers
+//! `textDocument/diagnostic` with one duplicate of a pushed item and
+//! one pull-only item, for the P3 merge gate), `rich` (advertises
+//! the definition-family, workspace-symbol, and code-action
+//! providers with scripted answers, for the P3 read-class gates).
 //!
 //! `$FAKE_LSP_PID_FILE`, when set, receives the fake's pid at start.
 
@@ -115,11 +120,20 @@ impl Fake {
                     .and_then(serde_json::Value::as_str)
                     .unwrap_or_default()
                     .to_string();
+                let capabilities = match self.mode.as_str() {
+                    "pull" => serde_json::json!({
+                        "diagnosticProvider": {
+                            "interFileDependencies": false,
+                            "workspaceDiagnostics": false
+                        }
+                    }),
+                    _ => serde_json::json!({}),
+                };
                 respond(
                     writer,
                     id,
                     serde_json::json!({
-                        "capabilities": {},
+                        "capabilities": capabilities,
                         "serverInfo": {"name": "theodolite-fake-lsp", "version": "1.0.0"}
                     }),
                 );
@@ -160,6 +174,35 @@ impl Fake {
             }
             "shutdown" => {
                 respond(writer, id, serde_json::Value::Null);
+                true
+            }
+            "textDocument/diagnostic" => {
+                // Pull mode: a full report with one item identical to
+                // a pushed item (same range/severity/source/code/
+                // message) and one pull-only item.
+                respond(
+                    writer,
+                    id,
+                    serde_json::json!({
+                        "kind": "full",
+                        "items": [
+                            {
+                                "range": range(1, 0, 1, 5),
+                                "severity": 1,
+                                "source": "clippy",
+                                "code": "shared_code",
+                                "message": "in both channels"
+                            },
+                            {
+                                "range": range(7, 0, 7, 3),
+                                "severity": 1,
+                                "source": "rustc",
+                                "code": "pull_only",
+                                "message": "pull only error"
+                            }
+                        ]
+                    }),
+                );
                 true
             }
             "textDocument/hover" => {
@@ -267,6 +310,40 @@ impl Fake {
                 &serde_json::json!({
                     "jsonrpc": "2.0", "id": 42, "method": "workspace/applyEdit",
                     "params": {"edit": {"changes": {}}}
+                }),
+            );
+            return;
+        }
+        if self.mode == "pull" {
+            if self.diagnostics_sent {
+                return;
+            }
+            self.diagnostics_sent = true;
+            // The push half of the pull-merge fixture: one item the
+            // pull report repeats verbatim, one push-only item.
+            let diagnostics = vec![
+                serde_json::json!({
+                    "range": range(1, 0, 1, 5),
+                    "severity": 1,
+                    "source": "clippy",
+                    "code": "shared_code",
+                    "message": "in both channels"
+                }),
+                serde_json::json!({
+                    "range": range(4, 2, 4, 9),
+                    "severity": 2,
+                    "source": "clippy",
+                    "code": "push_only",
+                    "message": "push only warning"
+                }),
+            ];
+            let _ = write_message(
+                writer,
+                "fake-lsp",
+                &serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "method": "textDocument/publishDiagnostics",
+                    "params": {"uri": uri, "diagnostics": diagnostics}
                 }),
             );
             return;

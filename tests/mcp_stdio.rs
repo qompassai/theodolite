@@ -280,6 +280,51 @@ fn diagnostics_waits_for_second_wave_and_sorts() {
 }
 
 #[test]
+fn pull_diagnostics_merge_with_push_provenance() {
+    let dir = temp_dir("pull-merge");
+    let ws = make_workspace(&dir);
+    let config = write_fake_config(&dir, "pull", "", &[]);
+    let mut bridge = Bridge::spawn(&config);
+    // Open the file so the fake pushes its push half.
+    let _ = bridge.call_tool("hover", hover_args(&ws));
+    let (is_error, result) = bridge.call_tool(
+        "diagnostics",
+        serde_json::json!({"workspace": ws.to_string_lossy(), "server": "fake"}),
+    );
+    assert!(!is_error, "{result}");
+    // 2 pushed + 2 pulled − 1 duplicate = 3 merged entries.
+    assert_eq!(result["count"], 3, "{result}");
+    let channels: Vec<&str> = result["channels"]
+        .as_array()
+        .expect("channels array")
+        .iter()
+        .map(|c| c.as_str().unwrap_or(""))
+        .collect();
+    assert_eq!(channels, vec!["pull", "push"]);
+    let by_message = |message: &str| {
+        result["diagnostics"]
+            .as_array()
+            .expect("diagnostics array")
+            .iter()
+            .find(|d| d["message"] == message)
+            .unwrap_or_else(|| panic!("diagnostic {message:?} missing from {result}"))
+            .clone()
+    };
+    // Sorted by range line: shared (1) < push only (4) < pull only (7).
+    let lines: Vec<u64> = result["diagnostics"]
+        .as_array()
+        .expect("diagnostics array")
+        .iter()
+        .map(|d| d["range"]["start"]["line"].as_u64().unwrap_or(99))
+        .collect();
+    assert_eq!(lines, vec![1, 4, 7]);
+    assert_eq!(by_message("in both channels")["channel"], "push+pull");
+    assert_eq!(by_message("push only warning")["channel"], "push");
+    assert_eq!(by_message("pull only error")["channel"], "pull");
+    bridge.shutdown();
+}
+
+#[test]
 fn session_status_reports_the_pinned_transcript() {
     let dir = temp_dir("status");
     let ws = make_workspace(&dir);

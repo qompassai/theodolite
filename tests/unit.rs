@@ -11,8 +11,8 @@ use theodolite::errors::BridgeError;
 use theodolite::lsp::{LspMessage, read_message, write_message};
 use theodolite::session::resolve_within;
 use theodolite::shaping::{
-    Diagnostic, Location, Position, Range, enforce_budget, relativize_uri, sort_diagnostics,
-    sort_locations, uri_to_path,
+    Diagnostic, DiagnosticChannel, Location, Position, Range, enforce_budget, merge_diagnostics,
+    relativize_uri, sort_diagnostics, sort_locations, uri_to_path,
 };
 
 fn temp_dir(tag: &str) -> PathBuf {
@@ -117,6 +117,7 @@ fn shaping_sorts_canonically_and_dedups_locations() {
             source: "clippy".into(),
             code: "x".into(),
             message: "m".into(),
+            channel: DiagnosticChannel::Push,
         },
         Diagnostic {
             uri: "file:///a.rs".into(),
@@ -125,6 +126,7 @@ fn shaping_sorts_canonically_and_dedups_locations() {
             source: "clippy".into(),
             code: "x".into(),
             message: "m".into(),
+            channel: DiagnosticChannel::Push,
         },
         Diagnostic {
             uri: "file:///a.rs".into(),
@@ -133,6 +135,7 @@ fn shaping_sorts_canonically_and_dedups_locations() {
             source: "clippy".into(),
             code: "x".into(),
             message: "m".into(),
+            channel: DiagnosticChannel::Push,
         },
     ];
     sort_diagnostics(&mut diagnostics);
@@ -157,6 +160,47 @@ fn shaping_sorts_canonically_and_dedups_locations() {
     sort_locations(&mut locations);
     assert_eq!(locations.len(), 2);
     assert_eq!(locations[0].range.start.line, 1);
+}
+
+#[test]
+fn merge_diagnostics_dedups_and_marks_provenance() {
+    let diagnostic = |line: u64, message: &str, channel: DiagnosticChannel| Diagnostic {
+        uri: "file:///a.rs".into(),
+        range: Range {
+            start: Position {
+                line,
+                character: 0,
+            },
+            end: Position {
+                line,
+                character: 3,
+            },
+        },
+        severity: 1,
+        source: "clippy".into(),
+        code: "x".into(),
+        message: message.into(),
+        channel,
+    };
+    let push = vec![
+        diagnostic(1, "shared", DiagnosticChannel::Push),
+        diagnostic(4, "push only", DiagnosticChannel::Push),
+    ];
+    let pull = vec![
+        diagnostic(1, "shared", DiagnosticChannel::Pull),
+        diagnostic(7, "pull only", DiagnosticChannel::Pull),
+    ];
+    let merged = merge_diagnostics(push, pull);
+    assert_eq!(merged.len(), 3);
+    let channels: Vec<&str> = merged.iter().map(|d| d.channel.as_str()).collect();
+    assert_eq!(channels, vec!["push+pull", "push", "pull"]);
+    // Same-channel duplicates also collapse.
+    let again = merge_diagnostics(
+        vec![diagnostic(1, "shared", DiagnosticChannel::Push)],
+        vec![diagnostic(1, "shared", DiagnosticChannel::Push)],
+    );
+    assert_eq!(again.len(), 1);
+    assert_eq!(again[0].channel, DiagnosticChannel::Push);
 }
 
 #[test]
