@@ -36,6 +36,19 @@ pub const VERSION_PROBE_TIMEOUT_MS: u64 = 10_000;
 pub const SETTLE_POLL_MS: u64 = 250;
 /// Readiness poll interval in milliseconds.
 pub const READY_POLL_MS: u64 = 100;
+/// Per-attempt timeout for the first-response readiness probe:
+/// one real request gets at most this long to answer before the
+/// attempt counts as not-ready and the poll loop tries again
+/// (the ready deadline still governs the whole wait).
+pub const FIRST_RESPONSE_PROBE_TIMEOUT_MS: u64 = 5_000;
+/// Bounds on the first-response probe-file search: directory
+/// depth and total entries scanned under the workspace root.
+/// The search is bounded work like everything else in the
+/// bridge; a workspace whose probe file hides past the bounds
+/// fails readiness loudly rather than scanning forever.
+pub const PROBE_SCAN_MAX_DEPTH: usize = 8;
+/// Entry bound companion to `PROBE_SCAN_MAX_DEPTH`.
+pub const PROBE_SCAN_MAX_ENTRIES: usize = 4096;
 /// Extra wait, beyond the supervisor's own grace, for the EOF
 /// escalation in `Session::shutdown` to take the tree down before
 /// the bridge falls back to killing the supervisor alone.
@@ -143,6 +156,11 @@ struct Inner {
     /// this, never probed by trial request: an unadvertised feature
     /// is a typed `UnsupportedMethod`, not a server error.
     server_capabilities: serde_json::Value,
+    /// The most recent first-response probe outcome, in words: what
+    /// the probe tried and what the server did with it. Recorded on
+    /// every attempt so a `ServerNotReady` failure names the
+    /// evidence instead of only the elapsed window.
+    probe_outcome: Option<String>,
     /// Action handles minted by `code_actions` for the gated apply
     /// (P5 item 3), keyed by their opaque id.
     action_handles: HashMap<String, StoredAction>,
@@ -189,6 +207,7 @@ impl SessionState {
                 last_quiescent_seq: 0,
                 progress_completed: 0,
                 server_capabilities: serde_json::Value::Null,
+                probe_outcome: None,
                 action_handles: HashMap::new(),
                 next_handle_seq: 0,
                 gate_log: Vec::new(),
@@ -408,17 +427,149 @@ impl Session {
                     return Ok(());
                 }
             }
+            if self.entry.readiness == Readiness::FirstResponse {
+                // One real answered request proves the server
+                // computes; background churn is not consulted at
+                // all, so a server that never goes quiescent is
+                // not held hostage by its own indexing.
+                if Instant::now() < deadline && self.first_response_probe() {
+                    self.state.lock().phase = Phase::Ready;
+                    return Ok(());
+                }
+            }
             if Instant::now() >= deadline {
+                let mut detail = format!(
+                    "readiness predicate {:?} did not hold within {} ms",
+                    self.entry.readiness, config.ready_timeout_ms
+                );
+                if self.entry.readiness == Readiness::FirstResponse
+                    && let Some(outcome) = self.state.lock().probe_outcome.clone()
+                {
+                    detail.push_str(&format!("; last probe: {outcome}"));
+                }
                 return Err(BridgeError::ServerNotReady {
                     server: self.entry.id.clone(),
-                    detail: format!(
-                        "readiness predicate {:?} did not hold within {} ms",
-                        self.entry.readiness, config.ready_timeout_ms
-                    ),
+                    detail,
                 });
             }
             std::thread::sleep(Duration::from_millis(READY_POLL_MS));
         }
+    }
+
+    /// One first-response probe attempt: pick the probe file, sync
+    /// it, and ask the server one real question about it. Returns
+    /// true only on a successful (non-error) answer — an error
+    /// response, a timeout, and a missing probe surface all count
+    /// as not-ready, never as ready. Every outcome is recorded so
+    /// the eventual `ServerNotReady` (if any) names the evidence.
+    ///
+    /// The probe method is read from the advertised capabilities,
+    /// never probed by trial: `documentSymbol` where advertised,
+    /// else `hover`. A server advertising neither cannot satisfy
+    /// this predicate, and the recorded outcome says exactly that.
+    fn first_response_probe(&self) -> bool {
+        let (method, with_position) = if self.capability_advertised("documentSymbolProvider") {
+            ("textDocument/documentSymbol", false)
+        } else if self.capability_advertised("hoverProvider") {
+            ("textDocument/hover", true)
+        } else {
+            self.record_probe_outcome(
+                "server advertises neither documentSymbolProvider nor hoverProvider; \
+                     no probe request exists to try",
+            );
+            return false;
+        };
+        let Some(path) = self.find_probe_file() else {
+            self.record_probe_outcome(
+                "no file with a served extension exists under the workspace root",
+            );
+            return false;
+        };
+        let (uri, _version) = match self.sync_file(&path) {
+            Ok(pair) => pair,
+            Err(error) => {
+                self.record_probe_outcome(&format!(
+                    "probe file {} could not be synced: {error}",
+                    path.display()
+                ));
+                return false;
+            }
+        };
+        let mut params = serde_json::json!({"textDocument": {"uri": uri}});
+        if with_position {
+            params["position"] = serde_json::json!({"line": 0, "character": 0});
+        }
+        // The attempt timeout is the fixed probe cap, NOT the time
+        // remaining to the ready deadline (the quiescent probe
+        // above makes the same choice). Clamping an attempt to a
+        // shrinking remainder manufactures timed-out requests
+        // whose late answers then land as unknown-id traffic and
+        // kill the session; the deadline governs the wait between
+        // attempts, one attempt may run to its own cap.
+        match self.request(method, params, FIRST_RESPONSE_PROBE_TIMEOUT_MS) {
+            Ok(_) => {
+                self.record_probe_outcome(&format!("{method} on {} answered", path.display()));
+                true
+            }
+            Err(error) => {
+                self.record_probe_outcome(&format!("{method} on {}: {error}", path.display()));
+                false
+            }
+        }
+    }
+
+    fn record_probe_outcome(&self, outcome: &str) {
+        self.state.lock().probe_outcome = Some(outcome.to_string());
+    }
+
+    /// Find the probe file for first-response readiness: the first
+    /// file under the workspace root whose extension this entry
+    /// serves. The walk is deterministic (directory entries are
+    /// sorted before use, so a fixed tree always yields the same
+    /// file), skips dot-named entries, and is bounded by
+    /// `PROBE_SCAN_MAX_DEPTH` / `PROBE_SCAN_MAX_ENTRIES`.
+    fn find_probe_file(&self) -> Option<PathBuf> {
+        let mut stack: Vec<(PathBuf, usize)> = vec![(self.workspace_root.clone(), 0)];
+        let mut scanned: usize = 0;
+        while let Some((dir, depth)) = stack.pop() {
+            let mut entries: Vec<PathBuf> = Vec::new();
+            let read = std::fs::read_dir(&dir).ok()?;
+            for entry in read {
+                let Ok(entry) = entry else { continue };
+                entries.push(entry.path());
+            }
+            entries.sort();
+            let mut subdirs: Vec<PathBuf> = Vec::new();
+            for path in entries {
+                scanned += 1;
+                if scanned > PROBE_SCAN_MAX_ENTRIES {
+                    return None;
+                }
+                let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
+                    continue;
+                };
+                if name.starts_with('.') {
+                    continue;
+                }
+                if path.is_dir() {
+                    if depth < PROBE_SCAN_MAX_DEPTH {
+                        subdirs.push(path);
+                    }
+                } else if path
+                    .extension()
+                    .and_then(|ext| ext.to_str())
+                    .is_some_and(|ext| self.entry.extensions.iter().any(|e| e == ext))
+                {
+                    return Some(path);
+                }
+            }
+            // Push reversed so the lexicographically first subdir
+            // is popped first: a depth-first walk in name order.
+            for subdir in subdirs.into_iter().rev() {
+                stack.push((subdir, depth + 1));
+            }
+        }
+        None
     }
 
     fn quiescence_holds(&self) -> bool {
@@ -1195,7 +1346,10 @@ pub fn resolve_within(workspace_root: &Path, raw: &str) -> BridgeResult<PathBuf>
 
 /// Probe a server's version: run `<binary> <probe argv>` with a
 /// scrubbed environment, a deadline, and a bounded output. The
-/// trimmed stdout is the actual version string (SPEC §4.1).
+/// actual version string is the trimmed stdout, falling back to
+/// the trimmed stderr when stdout is empty: several real servers
+/// (serve-d is one) print their version text on stderr only
+/// (SPEC §4.1).
 fn probe_version(entry: &ServerEntry) -> BridgeResult<String> {
     let mut command = Command::new(&entry.binary);
     command.args(&entry.version_probe);
@@ -1204,7 +1358,7 @@ fn probe_version(entry: &ServerEntry) -> BridgeResult<String> {
         command.env("HOME", home);
     }
     command.env("PATH", "/usr/local/bin:/usr/bin:/bin");
-    command.stdout(Stdio::piped()).stderr(Stdio::null());
+    command.stdout(Stdio::piped()).stderr(Stdio::piped());
     let mut child = command
         .spawn()
         .map_err(|e| io_error("spawning version probe", e))?;
@@ -1243,6 +1397,28 @@ fn probe_version(entry: &ServerEntry) -> BridgeResult<String> {
             server: entry.id.clone(),
             detail: "version probe output exceeds its byte cap".to_string(),
         });
+    }
+    if String::from_utf8_lossy(&output).trim().is_empty() {
+        // The serve-d case: the version text exists, but on stderr.
+        // The probe's contract is the version text the binary
+        // prints, not the stream it prints it on; stdout stays
+        // authoritative whenever it carries anything.
+        let mut err_output = Vec::new();
+        if let Some(mut stderr) = child.stderr.take() {
+            let mut limited = Read::take(&mut stderr, (VERSION_PROBE_MAX_BYTES + 1) as u64);
+            limited
+                .read_to_end(&mut err_output)
+                .map_err(|e| io_error("reading version probe stderr", e))?;
+        }
+        if err_output.len() > VERSION_PROBE_MAX_BYTES {
+            return Err(BridgeError::ServerNotReady {
+                server: entry.id.clone(),
+                detail: "version probe output exceeds its byte cap".to_string(),
+            });
+        }
+        if !String::from_utf8_lossy(&err_output).trim().is_empty() {
+            output = err_output;
+        }
     }
     Ok(String::from_utf8_lossy(&output).trim().to_string())
 }

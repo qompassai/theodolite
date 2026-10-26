@@ -57,14 +57,21 @@ env = {}
 # serve-d (D): plain stdio LSP, no argv — upstream's `--require`
 # values are feature names (`d`, `workspaces`), never component
 # names; an unsupported value makes serve-d refuse to start.
-# `quiescent`: serve-d loads the dub workspace and starts DCD
-# after the handshake and publishes diagnostics when that settles.
-# It spawns `dub`/`dcd-server` by name, so PATH must carry them.
+# `first-response`: serve-d loads the dub workspace and starts
+# DCD after the handshake on its own schedule; its indexing
+# never presents a quiescent window inside the readiness
+# timeout, so readiness is the handshake plus the first real
+# answered request against a workspace file. It spawns
+# `dub`/`dcd-server` by name, so PATH must carry them.
+# serve-d prints its version on stderr only; the probe accepts
+# the trimmed stderr when stdout is empty (SPEC §4.1).
 # Primo note (2026-10-26): the packaged serve-d 0.7.6-1 there
-# cannot launch (it needs libphobos2-ldc-shared.so.111; the system
-# LDC 1.43 ships .113), so this entry stays inert on primo — the
-# version probe refuses it, as designed — until serve-d is rebuilt
-# against the system compiler. See README "Capability notes".
+# cannot launch (it needs libphobos2-ldc-shared.so.111; the
+# system LDC 1.43 ships .113). A source-built serve-d exists at
+# ~/.local/bin/serve-d — point the machine copy's `binary`
+# there; live parity against it PASSED 2026-10-26 (bridge
+# document_symbols + hover match a direct probe exactly). See
+# README "Capability notes".
 [[server]]
 id = "serve-d"
 binary = "/usr/bin/serve-d"
@@ -73,5 +80,5 @@ expect_version = "RECORD-ON-TARGET-MACHINE"
 languages = ["d"]
 extensions = ["d", "di"]
 language_ids = { d = "d", di = "d" }
-readiness = "quiescent"
+readiness = "first-response"
 env = { PATH = "/usr/local/bin:/usr/bin:/bin" }

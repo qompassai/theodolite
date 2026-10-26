@@ -74,6 +74,27 @@ fn write_fake_config_version(
     path
 }
 
+/// Write a bridge config naming one fake server in `mode`, with
+/// the readiness predicate named instead of the default
+/// `immediate`.
+fn write_fake_config_readiness(
+    dir: &Path,
+    mode: &str,
+    readiness: &str,
+    extra_top: &str,
+    extra_env: &[(&str, &str)],
+) -> PathBuf {
+    let path = write_fake_config(dir, mode, extra_top, extra_env);
+    let body = std::fs::read_to_string(&path).expect("read generated config");
+    let replaced = body.replace(
+        "readiness = \"immediate\"",
+        &format!("readiness = \"{readiness}\""),
+    );
+    assert_ne!(body, replaced, "generated config carries no immediate line");
+    std::fs::write(&path, replaced).expect("rewrite config");
+    path
+}
+
 struct Bridge {
     child: Child,
     stdin: ChildStdin,
@@ -1541,6 +1562,28 @@ fn rename_preview_huge_edit_set_is_result_too_large() {
 }
 
 #[test]
+fn version_on_stderr_is_accepted_via_fallback() {
+    // The serve-d shape (parity finding, 2026-10-26): the binary
+    // prints its version on stderr and nothing on stdout. The
+    // probe compares the version text the binary prints, so the
+    // session must start and report the pinned transcript.
+    let dir = temp_dir("version-stderr");
+    let ws = make_workspace(&dir);
+    let config = write_fake_config(&dir, "stderrver", "", &[]);
+    let mut bridge = Bridge::spawn(&config);
+    let (is_error, result) = bridge.call_tool("hover", hover_args(&ws));
+    assert!(!is_error, "{result}");
+    let (is_error, result) = bridge.call_tool(
+        "session_status",
+        serde_json::json!({"workspace": ws.to_string_lossy(), "server": "fake"}),
+    );
+    assert!(!is_error, "{result}");
+    assert_eq!(result["actual_version"], FAKE_VERSION);
+    assert_eq!(result["phase"], "ready");
+    bridge.shutdown();
+}
+
+#[test]
 fn version_mismatch_is_refused_before_any_session() {
     let dir = temp_dir("version");
     let ws = make_workspace(&dir);
@@ -1790,5 +1833,159 @@ fn diagnostics_without_any_evidence_hits_the_ready_deadline() {
         elapsed < Duration::from_secs(25),
         "diagnostics hung past the ready deadline ({elapsed:?})"
     );
+    bridge.shutdown();
+}
+
+// --- First-response readiness ------------------------------------------
+
+#[test]
+fn first_response_readiness_serves_under_progress_churn() {
+    let dir = temp_dir("first-response-churn");
+    let ws = make_workspace(&dir);
+    let config = write_fake_config_readiness(&dir, "churn", "first-response", "", &[]);
+    let mut bridge = Bridge::spawn(&config);
+    // The fake's progress window never closes, so quiescence can
+    // never hold; first-response must serve anyway, because the
+    // server demonstrably computes (its documentSymbol answers).
+    let (is_error, result) = bridge.call_tool(
+        "document_symbols",
+        serde_json::json!({
+            "workspace": ws.to_string_lossy(), "server": "fake", "path": "main.rs"
+        }),
+    );
+    assert!(!is_error, "{result}");
+    assert_eq!(result["count"], 3);
+    let names: Vec<&str> = result["symbols"]
+        .as_array()
+        .expect("symbols")
+        .iter()
+        .map(|s| s["name"].as_str().unwrap_or(""))
+        .collect();
+    assert_eq!(names, vec!["aaa_first", "outer_fn", "inner_value"]);
+    bridge.shutdown();
+}
+
+#[test]
+fn first_response_readiness_falls_back_to_hover() {
+    let dir = temp_dir("first-response-hover");
+    let ws = make_workspace(&dir);
+    let config = write_fake_config_readiness(&dir, "hoveronly", "first-response", "", &[]);
+    let mut bridge = Bridge::spawn(&config);
+    // The fake advertises hover only and refuses documentSymbol
+    // outright; readiness can only have been established through
+    // the hover probe.
+    let (is_error, result) = bridge.call_tool("hover", hover_args(&ws));
+    assert!(!is_error, "{result}");
+    assert_eq!(result["contents"]["value"], "fake hover for `foo`");
+    bridge.shutdown();
+}
+
+#[test]
+fn first_response_readiness_refuses_a_server_that_never_answers() {
+    let dir = temp_dir("first-response-slow");
+    let ws = make_workspace(&dir);
+    let config = write_fake_config_readiness(
+        &dir,
+        "slow",
+        "first-response",
+        "ready_timeout_ms = 3000",
+        &[],
+    );
+    let mut bridge = Bridge::spawn(&config);
+    // The fake completes the handshake and then never answers
+    // anything: the probe must not mistake a live handshake for
+    // readiness, and the failure must arrive at the deadline.
+    let started = Instant::now();
+    let (is_error, result) = bridge.call_tool("hover", hover_args(&ws));
+    let elapsed = started.elapsed();
+    assert!(is_error, "{result}");
+    assert_eq!(Bridge::error_code(&result), "ServerNotReady", "{result}");
+    assert!(
+        elapsed >= Duration::from_millis(2_500),
+        "refused after {elapsed:?}; it did not wait out the deadline"
+    );
+    assert!(
+        elapsed < Duration::from_secs(25),
+        "hung past the ready deadline ({elapsed:?})"
+    );
+    bridge.shutdown();
+}
+
+#[test]
+fn first_response_readiness_refuses_error_answers() {
+    let dir = temp_dir("first-response-errprobe");
+    let ws = make_workspace(&dir);
+    let config = write_fake_config_readiness(
+        &dir,
+        "errprobe",
+        "first-response",
+        "ready_timeout_ms = 3000",
+        &[],
+    );
+    let mut bridge = Bridge::spawn(&config);
+    // The fake answers every probe promptly — with an error. An
+    // answer is not a success: readiness must never latch, and
+    // the refusal must carry the probe's own evidence.
+    let (is_error, result) = bridge.call_tool(
+        "document_symbols",
+        serde_json::json!({
+            "workspace": ws.to_string_lossy(), "server": "fake", "path": "main.rs"
+        }),
+    );
+    assert!(is_error, "{result}");
+    assert_eq!(Bridge::error_code(&result), "ServerNotReady", "{result}");
+    let message = result["error"]["message"].as_str().unwrap_or_default();
+    assert!(
+        message.contains("still indexing"),
+        "refusal does not name the probe evidence: {message}"
+    );
+    bridge.shutdown();
+}
+
+#[test]
+fn first_response_readiness_refuses_without_a_probe_capability() {
+    let dir = temp_dir("first-response-nocap");
+    let ws = make_workspace(&dir);
+    let config = write_fake_config_readiness(
+        &dir,
+        "normal",
+        "first-response",
+        "ready_timeout_ms = 2000",
+        &[],
+    );
+    let mut bridge = Bridge::spawn(&config);
+    // The fake advertises neither documentSymbol nor hover, so no
+    // probe request exists: the entry's chosen predicate cannot
+    // be satisfied and must fail loudly, never silently degrade
+    // to a weaker predicate.
+    let (is_error, result) = bridge.call_tool("hover", hover_args(&ws));
+    assert!(is_error, "{result}");
+    assert_eq!(Bridge::error_code(&result), "ServerNotReady", "{result}");
+    let message = result["error"]["message"].as_str().unwrap_or_default();
+    assert!(
+        message.contains("documentSymbolProvider"),
+        "refusal does not name the missing capability: {message}"
+    );
+    bridge.shutdown();
+}
+
+#[test]
+fn progress_churn_still_fails_quiescent_readiness() {
+    let dir = temp_dir("churn-quiescent");
+    let ws = make_workspace(&dir);
+    let config =
+        write_fake_config_readiness(&dir, "churn", "quiescent", "ready_timeout_ms = 2000", &[]);
+    let mut bridge = Bridge::spawn(&config);
+    // The same churning fake under the quiescent predicate must
+    // still fail: first-response was added as an opt-in, and the
+    // default predicate was not weakened to accommodate it.
+    let (is_error, result) = bridge.call_tool(
+        "document_symbols",
+        serde_json::json!({
+            "workspace": ws.to_string_lossy(), "server": "fake", "path": "main.rs"
+        }),
+    );
+    assert!(is_error, "{result}");
+    assert_eq!(Bridge::error_code(&result), "ServerNotReady", "{result}");
     bridge.shutdown();
 }

@@ -42,8 +42,9 @@ readiness = "immediate"
 
 /// The serve-d registry entry from `bridge.toml.example`, verbatim
 /// in shape: both D extensions share the one LSP language id, and
-/// readiness is the quiescent predicate (workspace load + DCD
-/// startup settle after the handshake).
+/// readiness is the first-response predicate (serve-d's workspace
+/// indexing never goes quiescent inside the readiness window;
+/// the first real answered request is its readiness evidence).
 const SERVED_SERVER: &str = r#"
 [[server]]
 id = "serve-d"
@@ -53,7 +54,7 @@ expect_version = "serve-d 0.7.6"
 languages = ["d"]
 extensions = ["d", "di"]
 language_ids = { d = "d", di = "d" }
-readiness = "quiescent"
+readiness = "first-response"
 env = { PATH = "/usr/local/bin:/usr/bin:/bin" }
 "#;
 
@@ -85,8 +86,16 @@ fn config_serve_d_entry_loads() {
     assert_eq!(server.args, Vec::<String>::new());
     assert_eq!(server.language_ids.get("d").map(String::as_str), Some("d"));
     assert_eq!(server.language_ids.get("di").map(String::as_str), Some("d"));
-    assert_eq!(server.readiness, Readiness::Quiescent);
+    assert_eq!(server.readiness, Readiness::FirstResponse);
     assert!(!server.diagnostics_owner);
+}
+
+#[test]
+fn config_first_response_readiness_loads() {
+    let dir = temp_dir("cfg-first-response");
+    let body = VALID_SERVER.replace("immediate", "first-response");
+    let config = Config::load(&write_config(&dir, &body)).expect("first-response config loads");
+    assert_eq!(config.servers[0].readiness, Readiness::FirstResponse);
 }
 
 #[test]

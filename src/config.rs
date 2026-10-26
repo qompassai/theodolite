@@ -37,6 +37,14 @@ pub enum Readiness {
     /// Ready when no `$/progress` work is in flight and a probe
     /// request succeeds (rust-analyzer's shape).
     Quiescent,
+    /// Ready when the initialize handshake has completed and one
+    /// real request against a probe file from the workspace —
+    /// `textDocument/documentSymbol`, or `textDocument/hover`
+    /// where symbols are not advertised — succeeds. For servers
+    /// that compute immediately but never go quiescent, because
+    /// their startup indexing churn outlives every readiness
+    /// window (serve-d's shape).
+    FirstResponse,
 }
 
 impl Readiness {
@@ -44,6 +52,7 @@ impl Readiness {
         match raw {
             "immediate" => Ok(Readiness::Immediate),
             "quiescent" => Ok(Readiness::Quiescent),
+            "first-response" => Ok(Readiness::FirstResponse),
             other => Err(BridgeError::ConfigInvalid {
                 detail: format!("unknown readiness predicate {other:?}"),
             }),

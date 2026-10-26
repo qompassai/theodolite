@@ -25,7 +25,18 @@
 //! exactly one diagnostics set — the P2 Finding 3 shape, for the P4
 //! settle gates), `never-publish` (answers requests but never
 //! publishes, progresses, or advertises anything — the settle
-//! deadline case). The `rich` mode also serves rename:
+//! deadline case), `stderrver` (answers requests normally, but
+//! prints its `--version` text on stderr only — the serve-d
+//! shape, for the version-probe stream-fallback gate),
+//! `churn` (advertises documentSymbol and answers requests
+//! normally, but opens a `$/progress` window at initialize that
+//! never ends, so quiescence never holds — the serve-d indexing
+//! shape, for the first-response readiness gates), `hoveronly`
+//! (advertises hover only and errors documentSymbol — the
+//! first-response probe must fall back to hover), `errprobe`
+//! (advertises documentSymbol but answers it with an error
+//! forever — an answered-with-error server is not a ready
+//! server). The `rich` mode also serves rename:
 //! `prepareRename` (null at line 99 — not renameable) and `rename`
 //! with scripted edit sets keyed by the requested new name
 //! (`docchanges` = the documentChanges wire shape, `fileops` = a
@@ -44,15 +55,21 @@ use theodolite::lsp::{LspMessage, read_message, write_message};
 
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
-    if args.iter().any(|arg| arg == "--version") {
-        println!("theodolite-fake-lsp 1.0.0");
-        return;
-    }
     let mode = args
         .windows(2)
         .find(|pair| pair[0] == "--mode")
         .map(|pair| pair[1].clone())
         .unwrap_or_else(|| "normal".to_string());
+    if args.iter().any(|arg| arg == "--version") {
+        // Mode `stderrver` is the serve-d shape: the version text
+        // exists but is printed on stderr, stdout stays empty.
+        if mode == "stderrver" {
+            eprintln!("theodolite-fake-lsp 1.0.0");
+        } else {
+            println!("theodolite-fake-lsp 1.0.0");
+        }
+        return;
+    }
     if let Ok(pid_file) = std::env::var("FAKE_LSP_PID_FILE") {
         let _ = std::fs::write(&pid_file, std::process::id().to_string());
     }
@@ -128,6 +145,33 @@ impl Fake {
         if self.mode == "crash" && method == "textDocument/hover" {
             std::process::exit(2);
         }
+        if self.mode == "hoveronly" && method == "textDocument/documentSymbol" {
+            // Symbols are not this server's surface: the request
+            // itself is refused, so a bridge that probes symbols
+            // despite the capability set can never go ready here.
+            let _ = write_message(
+                writer,
+                "fake-lsp",
+                &serde_json::json!({
+                    "jsonrpc": "2.0", "id": id,
+                    "error": {"code": -32601, "message": "fake has no symbols"}
+                }),
+            );
+            return true;
+        }
+        if self.mode == "errprobe" && method == "textDocument/documentSymbol" {
+            // Perpetually mid-index: the request is answered, but
+            // with an error — an answer is not a success.
+            let _ = write_message(
+                writer,
+                "fake-lsp",
+                &serde_json::json!({
+                    "jsonrpc": "2.0", "id": id,
+                    "error": {"code": -32803, "message": "still indexing"}
+                }),
+            );
+            return true;
+        }
         match method {
             "initialize" => {
                 self.root_uri = params
@@ -150,6 +194,12 @@ impl Fake {
                         "codeActionProvider": true,
                         "renameProvider": {"prepareSupport": true}
                     }),
+                    "churn" | "errprobe" => serde_json::json!({
+                        "documentSymbolProvider": true
+                    }),
+                    "hoveronly" => serde_json::json!({
+                        "hoverProvider": true
+                    }),
                     _ => serde_json::json!({}),
                 };
                 respond(
@@ -161,6 +211,24 @@ impl Fake {
                     }),
                 );
                 match self.mode.as_str() {
+                    "churn" => {
+                        // A progress window that opens and never
+                        // closes: work is perpetually in flight, so
+                        // a quiescence predicate can never hold,
+                        // while ordinary requests answer fine.
+                        let _ = write_message(
+                            writer,
+                            "fake-lsp",
+                            &serde_json::json!({
+                                "jsonrpc": "2.0",
+                                "method": "$/progress",
+                                "params": {
+                                    "token": "churn-forever",
+                                    "value": {"kind": "begin", "title": "indexing"}
+                                }
+                            }),
+                        );
+                    }
                     "oversized" => {
                         // A header declaring a body past the frame
                         // cap, then nothing: the bridge must reject
