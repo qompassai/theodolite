@@ -30,7 +30,7 @@ closed list by construction.
 Servers (config data, not code): bacon-ls (diagnostics owner),
 rust-analyzer (semantics), lua-language-server (second proof
 server), serve-d (D; config entry and unit coverage landed,
-live-session parity still owed — see Capability notes).
+live-session parity passed 2026-10-26 — see Capability notes).
 
 ## Capability notes — serve-d
 
@@ -40,7 +40,12 @@ live-session parity still owed — see Capability notes).
   the registry entry carries no args.
 - serve-d fronts DCD for completion/definition and loads the dub
   workspace after the handshake; the entry therefore declares
-  `quiescent` readiness and a PATH carrying `dub`/`dcd-server`.
+  `first-response` readiness and a PATH carrying `dub`/`dcd-server`.
+  serve-d activates its project seconds after the handshake on
+  its own schedule, and its workspace indexing never presents a
+  quiescent window inside the readiness timeout — so readiness
+  is the handshake plus the first real answered request against
+  a workspace file (SPEC §3/§7), not drained progress.
 - Its custom `served/*` requests and `coded/*` notifications stay
   outside the bridge's closed read surface by construction; the
   standard read methods are what the tools exercise. Configuration
@@ -49,13 +54,23 @@ live-session parity still owed — see Capability notes).
 - Primo status (verified 2026-10-26): the packaged serve-d
   0.7.6-1 cannot launch — it links `libphobos2-ldc-shared.so.111`
   and `libdruntime-ldc-shared.so.111`, while the system LDC 1.43
-  ships only the `.113` pair — so on primo the version probe
-  refuses the entry until serve-d is rebuilt against the system
-  compiler (the AUR package rebuilt locally, or an upstream
-  source build with dub + LDC 1.43). `dcd-server`/`dcd-client`
+  ships only the `.113` pair. A source-built serve-d (dub + LDC
+  1.43) now exists on primo at `~/.local/bin/serve-d`; machine
+  copies of this config point `binary` there, while the shipped
+  example keeps `/usr/bin/serve-d`. serve-d prints its version
+  on stderr only; the version probe accepts the trimmed stderr
+  when stdout is empty (SPEC §4.1). `dcd-server`/`dcd-client`
   0.16.3 and dfmt 0.15.2 on the same machine run fine. A live
-  parity run for this entry is owed once a launchable serve-d
-  exists; nothing here claims one.
+  parity run for this entry PASSED on primo on 2026-10-26
+  against the source-built binary: the bridge session reached
+  ready under `first-response`, and its `document_symbols` and
+  `hover` results for the probe file match a direct LSP probe
+  of the same binary exactly (symbols `add`/`main` with
+  identical ranges; hover text identical). Calls made before
+  serve-d's delayed project activation completes return the
+  server's own empty answers — a direct client at the same
+  moment gets the same emptiness; that is serve-d's timing,
+  faithfully passed through, not a bridge loss.
 
 ## Mutation class (P5; gated, off by default)
 
