@@ -35,6 +35,15 @@ pub const VERSION_PROBE_TIMEOUT_MS: u64 = 10_000;
 pub const SETTLE_POLL_MS: u64 = 250;
 /// Readiness poll interval in milliseconds.
 pub const READY_POLL_MS: u64 = 100;
+/// Extra wait, beyond the supervisor's own grace, for the EOF
+/// escalation in `Session::shutdown` to take the tree down before
+/// the bridge falls back to killing the supervisor alone.
+pub const EOF_ESCALATION_SLACK_MS: u64 = 1_000;
+/// Cap on the advisory drain in `Session::diagnostics_context`:
+/// long enough for a publish provoked by the sync that precedes it
+/// to be consumed by the reader thread, short enough to never park
+/// a code-action call on a silent server.
+pub const CONTEXT_DRAIN_MAX_MS: u64 = 2_000;
 /// Absolute path of the pdeathsig wrapper (util-linux).
 pub const SETPRIV_PATH: &str = "/usr/bin/setpriv";
 
@@ -149,7 +158,9 @@ pub struct Session {
     /// Actual probed version string (transcript, SPEC §4.2).
     pub actual_version: String,
     state: Arc<SessionState>,
-    stdin: Arc<Mutex<ChildStdin>>,
+    /// The supervisor's stdin. `None` after `close_stdin`: closing
+    /// it is the supervisor's EOF shutdown trigger (P4 item 1).
+    stdin: Arc<Mutex<Option<ChildStdin>>>,
     child: Arc<Mutex<Child>>,
     pending: Arc<PendingMap>,
     next_id: AtomicI64,
@@ -175,7 +186,7 @@ impl Session {
                 actual: actual_version,
             });
         }
-        let (mut child, pid) = spawn_child(entry, workspace_root)?;
+        let (mut child, pid) = spawn_child(entry, workspace_root, config.shutdown_grace_ms)?;
         let stdin = child.stdin.take().ok_or_else(|| BridgeError::Io {
             detail: "child stdin was not piped".to_string(),
         })?;
@@ -187,7 +198,7 @@ impl Session {
         })?;
         let _ = pid;
         let state = Arc::new(SessionState::new(bridge_started.elapsed().as_millis()));
-        let stdin = Arc::new(Mutex::new(stdin));
+        let stdin = Arc::new(Mutex::new(Some(stdin)));
         let child = Arc::new(Mutex::new(child));
         let pending: Arc<PendingMap> = Arc::new(Mutex::new(HashMap::new()));
         spawn_stderr_drain(stderr, Arc::clone(&state));
@@ -414,7 +425,12 @@ impl Session {
     fn send_frame(&self, frame: &serde_json::Value) -> BridgeResult<()> {
         let outcome = {
             let mut guard = self.stdin.lock().unwrap_or_else(|p| p.into_inner());
-            write_message(&mut *guard, &self.entry.id, frame)
+            match guard.as_mut() {
+                Some(writer) => write_message(writer, &self.entry.id, frame),
+                None => Err(BridgeError::Io {
+                    detail: "session stdin is closed (shutdown in progress)".to_string(),
+                }),
+            }
         };
         match outcome {
             Ok(()) => Ok(()),
@@ -658,19 +674,42 @@ impl Session {
         value
     }
 
-    /// Child pid and liveness for `session_status`.
+    /// Tree-root pid and liveness for `session_status`. Since P4
+    /// the pid is the session SUPERVISOR's — the owned root of the
+    /// server tree — not the language server's own pid.
     pub fn pid_and_liveness(&self) -> (u32, bool) {
         let guard = self.child.lock().unwrap_or_else(|p| p.into_inner());
         (guard.id(), !self.state.reaped.load(Ordering::SeqCst))
     }
 
-    /// Graceful shutdown (SPEC §3.6): LSP `shutdown` + `exit`, grace,
-    /// then SIGKILL the child if it survives; the reaper reaps it.
+    /// Close the supervisor's stdin. Dropping the handle sends EOF
+    /// down the pipe; the supervisor treats EOF as a shutdown
+    /// trigger and kills the whole tree once its own grace expires
+    /// (P4 item 1).
+    fn close_stdin(&self) {
+        let mut guard = self.stdin.lock().unwrap_or_else(|p| p.into_inner());
+        *guard = None;
+    }
+
+    /// Graceful shutdown (SPEC §3.6): LSP `shutdown` + `exit` with a
+    /// grace window; if the tree survives that, close stdin so the
+    /// supervisor escalates to a whole-tree kill after its grace;
+    /// `Child::kill` on the supervisor remains only as the last
+    /// resort for a wedged supervisor (documented residue class in
+    /// the README's section 3.6 statement).
     pub fn shutdown(&self, grace_ms: u64) {
         if !self.state.reaped.load(Ordering::SeqCst) {
             let _ = self.request("shutdown", serde_json::Value::Null, grace_ms);
             let _ = self.notify("exit", serde_json::Value::Null);
             let deadline = Instant::now() + Duration::from_millis(grace_ms);
+            while !self.state.reaped.load(Ordering::SeqCst) && Instant::now() < deadline {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+        }
+        if !self.state.reaped.load(Ordering::SeqCst) {
+            self.close_stdin();
+            let deadline =
+                Instant::now() + Duration::from_millis(grace_ms + EOF_ESCALATION_SLACK_MS);
             while !self.state.reaped.load(Ordering::SeqCst) && Instant::now() < deadline {
                 std::thread::sleep(Duration::from_millis(10));
             }
@@ -902,11 +941,35 @@ fn probe_version(entry: &ServerEntry) -> BridgeResult<String> {
     Ok(String::from_utf8_lossy(&output).trim().to_string())
 }
 
-/// Spawn the language-server child under the estate's orphan-proof
-/// discipline (SPEC §3.1).
-fn spawn_child(entry: &ServerEntry, workspace_root: &Path) -> BridgeResult<(Child, u32)> {
-    let mut command = Command::new(SETPRIV_PATH);
+/// Spawn one session's process tree under the estate's
+/// orphan-proof discipline (SPEC §3.1 as extended by §3.6/P4): the
+/// bridge re-executes itself in supervisor mode
+/// (`crate::supervisor`) as the direct child, in a fresh process
+/// group led by the supervisor, and the supervisor spawns the server
+/// — still wrapped in `setpriv --pdeathsig SIGKILL`, now binding the
+/// server to the supervisor — inside that group. The returned pid is
+/// the SUPERVISOR's: it is the owned root of the tree, and
+/// session_status reports it as such. The server inherits the
+/// scrubbed environment unchanged through the supervisor.
+fn spawn_child(
+    entry: &ServerEntry,
+    workspace_root: &Path,
+    shutdown_grace_ms: u64,
+) -> BridgeResult<(Child, u32)> {
+    let exe = std::env::current_exe()
+        .map_err(|e| io_error("resolving the bridge executable for supervision", e))?;
+    let bridge_start = crate::supervisor::self_starttime_ticks().unwrap_or(0);
+    let mut command = Command::new(&exe);
     command
+        .arg(crate::supervisor::SUPERVISE_FLAG)
+        .arg("--bridge-pid")
+        .arg(std::process::id().to_string())
+        .arg("--bridge-start")
+        .arg(bridge_start.to_string())
+        .arg("--grace-ms")
+        .arg(shutdown_grace_ms.to_string())
+        .arg("--")
+        .arg(SETPRIV_PATH)
         .arg("--pdeathsig")
         .arg("SIGKILL")
         .arg("--")
@@ -932,7 +995,7 @@ fn spawn_child(entry: &ServerEntry, workspace_root: &Path) -> BridgeResult<(Chil
     command.process_group(0);
     let child = command
         .spawn()
-        .map_err(|e| io_error("spawning language server via setpriv", e))?;
+        .map_err(|e| io_error("spawning session supervisor", e))?;
     let pid = child.id();
     Ok((child, pid))
 }
@@ -990,7 +1053,7 @@ fn spawn_reader(
     mut stdout: impl Read + Send + 'static,
     entry: ServerEntry,
     state: Arc<SessionState>,
-    stdin: Arc<Mutex<ChildStdin>>,
+    stdin: Arc<Mutex<Option<ChildStdin>>>,
     pending: Arc<PendingMap>,
 ) {
     std::thread::spawn(move || {
@@ -1121,7 +1184,7 @@ fn handle_notification(state: &Arc<SessionState>, method: &str, params: &serde_j
 fn handle_server_request(
     entry: &ServerEntry,
     state: &Arc<SessionState>,
-    stdin: &Arc<Mutex<ChildStdin>>,
+    stdin: &Arc<Mutex<Option<ChildStdin>>>,
     id: serde_json::Value,
     method: &str,
     params: &serde_json::Value,
@@ -1166,5 +1229,7 @@ fn handle_server_request(
         }
     };
     let mut guard = stdin.lock().unwrap_or_else(|p| p.into_inner());
-    let _ = write_message(&mut *guard, &entry.id, &reply);
+    if let Some(writer) = guard.as_mut() {
+        let _ = write_message(writer, &entry.id, &reply);
+    }
 }

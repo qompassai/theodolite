@@ -17,7 +17,15 @@
 //! `textDocument/diagnostic` with one duplicate of a pushed item and
 //! one pull-only item, for the P3 merge gate), `rich` (advertises
 //! the definition-family, workspace-symbol, and code-action
-//! providers with scripted answers, for the P3 read-class gates).
+//! providers with scripted answers, for the P3 read-class gates),
+//! `daemon` (on didOpen, leaks a long-lived grandchild into its own
+//! process group and writes its pid to `$FAKE_LSP_DAEMON_PID_FILE`;
+//! answers requests normally otherwise — for the P4 tree-ownership
+//! gates), `late-publish` (on didOpen, waits ~3 s, then publishes
+//! exactly one diagnostics set — the P2 Finding 3 shape, for the P4
+//! settle gates), `never-publish` (answers requests but never
+//! publishes, progresses, or advertises anything — the settle
+//! deadline case).
 //!
 //! `$FAKE_LSP_PID_FILE`, when set, receives the fake's pid at start.
 
@@ -453,6 +461,53 @@ impl Fake {
             .unwrap_or_default()
             .to_string();
         self.opened_uri = Some(uri.clone());
+        if self.mode == "daemon" {
+            if self.diagnostics_sent {
+                return;
+            }
+            self.diagnostics_sent = true;
+            // Leak a daemon grandchild: spawned into this process's
+            // group, never waited on, outliving the fake unless the
+            // session's owner reaps the whole tree (P4 item 1).
+            let spawned = std::process::Command::new("/bin/sleep")
+                .arg("3600")
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .spawn();
+            if let (Ok(child), Ok(pid_file)) = (spawned, std::env::var("FAKE_LSP_DAEMON_PID_FILE"))
+            {
+                let _ = std::fs::write(&pid_file, child.id().to_string());
+            }
+            return;
+        }
+        if self.mode == "late-publish" {
+            if self.diagnostics_sent {
+                return;
+            }
+            self.diagnostics_sent = true;
+            // P2 Finding 3's shape: the first publish lands seconds
+            // after didOpen. A settle predicate that only watches
+            // stability returns an empty set long before this.
+            std::thread::sleep(std::time::Duration::from_millis(3_000));
+            let diagnostics = vec![serde_json::json!({
+                "range": range(2, 0, 2, 7),
+                "severity": 1,
+                "source": "latecheck",
+                "code": "late_code",
+                "message": "late arrival diagnostic"
+            })];
+            let _ = write_message(
+                writer,
+                "fake-lsp",
+                &serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "method": "textDocument/publishDiagnostics",
+                    "params": {"uri": uri, "diagnostics": diagnostics}
+                }),
+            );
+            return;
+        }
         if self.mode == "applyedit" {
             let _ = write_message(
                 writer,

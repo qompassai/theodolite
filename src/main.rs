@@ -14,6 +14,14 @@ use theodolite::config::Config;
 use theodolite::session::SessionManager;
 
 fn main() {
+    // Supervisor mode (SPEC section 3.6): the bridge re-executes
+    // itself with --supervise to own one session's process tree.
+    // This dispatch precedes all config handling; a supervisor
+    // never reads bridge.toml.
+    let raw_args: Vec<String> = std::env::args().skip(1).collect();
+    if raw_args.first().map(String::as_str) == Some(theodolite::supervisor::SUPERVISE_FLAG) {
+        std::process::exit(theodolite::supervisor::run_supervisor(&raw_args[1..]));
+    }
     let config_path = match parse_config_path() {
         Ok(path) => path,
         Err(message) => {

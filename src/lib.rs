@@ -21,6 +21,7 @@ pub mod lsp;
 pub mod mcp;
 pub mod session;
 pub mod shaping;
+pub mod supervisor;
 pub mod tools;
 
 /// Toolchain pin, mirroring this repo's `rust-toolchain.toml`;

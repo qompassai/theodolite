@@ -298,3 +298,28 @@ fn path_escapes_are_refused_in_all_forms() {
     let ok = resolve_within(&root, "inside.rs").expect("inside resolves");
     assert!(ok.ends_with("inside.rs"));
 }
+
+#[test]
+fn supervisor_stat_parse_reads_pgrp_and_starttime() {
+    // Field layout after the comm: state ppid pgrp session tty_nr
+    // tpgid flags ... starttime is overall field 22 (index 19 of
+    // the post-comm tail). Fixtures counted token by token.
+    let line = "1659452 (head) R 1441586 1659452 1659452 0 -1 4194304 426 140 0 0 0 0 0 0 20 0 1 0 119799232 2785280";
+    assert_eq!(
+        theodolite::supervisor::parse_stat(line),
+        Some((1659452, 119799232))
+    );
+    // A comm containing spaces and parentheses must not shift the
+    // fields: parsing starts after the LAST closing paren.
+    let weird = "42 (weird ) name (x) S 1 42 42 0 -1 0 0 0 0 0 0 0 0 0 0 0 0 0 777 0";
+    assert_eq!(theodolite::supervisor::parse_stat(weird), Some((42, 777)));
+    // Adversarial: truncated and garbage lines parse to None, never
+    // a panic or a wrong group.
+    assert_eq!(theodolite::supervisor::parse_stat("42 (x) S 1"), None);
+    assert_eq!(theodolite::supervisor::parse_stat(""), None);
+    assert_eq!(theodolite::supervisor::parse_stat("no parens at all"), None);
+    assert_eq!(
+        theodolite::supervisor::parse_stat("1 (x) S a b c 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0"),
+        None
+    );
+}
