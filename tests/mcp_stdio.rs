@@ -443,6 +443,51 @@ fn workspace_symbols_are_sorted_across_files() {
 }
 
 #[test]
+fn code_actions_lists_titles_kinds_and_payload_presence() {
+    let dir = temp_dir("code-actions");
+    let ws = make_workspace(&dir);
+    let config = write_fake_config(&dir, "rich", "", &[]);
+    let mut bridge = Bridge::spawn(&config);
+    let (is_error, result) = bridge.call_tool("code_actions", hover_args(&ws));
+    assert!(!is_error, "{result}");
+    assert_eq!(result["count"], 4, "{result}");
+    // Sorted by title; presence flags per entry shape: CodeAction
+    // with both payloads, command-only CodeAction, bare Command,
+    // and a payload-free suggestion.
+    let actions = result["actions"].as_array().expect("actions array");
+    let titles: Vec<&str> = actions
+        .iter()
+        .map(|a| a["title"].as_str().unwrap_or(""))
+        .collect();
+    assert_eq!(
+        titles,
+        vec![
+            "Alphabet fix",
+            "Fix the thing",
+            "Legacy command",
+            "Zulu refactor"
+        ]
+    );
+    let by_title = |title: &str| {
+        actions
+            .iter()
+            .find(|a| a["title"] == title)
+            .unwrap_or_else(|| panic!("action {title:?} missing"))
+            .clone()
+    };
+    assert_eq!(by_title("Fix the thing")["kind"], "quickfix");
+    assert_eq!(by_title("Fix the thing")["has_edit"], true);
+    assert_eq!(by_title("Fix the thing")["has_command"], true);
+    assert_eq!(by_title("Alphabet fix")["has_edit"], false);
+    assert_eq!(by_title("Alphabet fix")["has_command"], true);
+    assert_eq!(by_title("Legacy command")["kind"], "");
+    assert_eq!(by_title("Legacy command")["has_command"], true);
+    assert_eq!(by_title("Zulu refactor")["has_edit"], false);
+    assert_eq!(by_title("Zulu refactor")["has_command"], false);
+    bridge.shutdown();
+}
+
+#[test]
 fn session_restart_returns_a_fresh_transcript() {
     let dir = temp_dir("restart-ok");
     let ws = make_workspace(&dir);
@@ -749,6 +794,7 @@ fn mutation_tools_are_absent_and_unregistered() {
             "references",
             "document_symbols",
             "workspace_symbols",
+            "code_actions",
             "session_restart"
         ]
     );
@@ -844,6 +890,77 @@ fn workspace_symbols_over_budget_reports_true_count() {
     assert_eq!(result["error"]["items"], 1500);
     assert_eq!(result["error"]["budget_bytes"], 65_536);
     assert!(result.get("symbols").is_none(), "partial payload leaked");
+    bridge.shutdown();
+}
+
+#[test]
+fn code_actions_payloads_never_reach_the_result() {
+    let dir = temp_dir("code-actions-secrecy");
+    let ws = make_workspace(&dir);
+    let config = write_fake_config(&dir, "rich", "", &[]);
+    let mut bridge = Bridge::spawn(&config);
+    let frame = bridge.request(
+        "tools/call",
+        serde_json::json!({"name": "code_actions", "arguments": hover_args(&ws)}),
+    );
+    let text = frame["result"]["content"][0]["text"]
+        .as_str()
+        .unwrap_or("")
+        .to_string();
+    // Neither the edit body, the command id, nor the command's
+    // arguments may appear anywhere in the rendered result.
+    for marker in [
+        "PAYLOAD-MARKER-EDIT",
+        "PAYLOAD-MARKER-COMMAND",
+        "secret.command.id",
+        "legacy.cmd",
+        "newText",
+    ] {
+        assert!(!text.contains(marker), "payload marker {marker:?} leaked");
+    }
+    let parsed: serde_json::Value = serde_json::from_str(&text).expect("result JSON");
+    for action in parsed["actions"].as_array().expect("actions array") {
+        let keys: Vec<&str> = action
+            .as_object()
+            .expect("action object")
+            .keys()
+            .map(String::as_str)
+            .collect();
+        assert_eq!(
+            keys,
+            vec!["has_command", "has_edit", "kind", "title"],
+            "action keys drifted: {keys:?}"
+        );
+    }
+    bridge.shutdown();
+}
+
+#[test]
+fn code_actions_empty_is_distinct_from_unsupported() {
+    let dir = temp_dir("code-actions-empty");
+    let ws = make_workspace(&dir);
+    let config = write_fake_config(&dir, "rich", "", &[]);
+    let mut bridge = Bridge::spawn(&config);
+    // Line 99 is the fake's no-actions region: a valid empty list.
+    let (is_error, result) = bridge.call_tool(
+        "code_actions",
+        serde_json::json!({
+            "workspace": ws.to_string_lossy(), "server": "fake",
+            "path": "main.rs", "line": 99, "character": 0
+        }),
+    );
+    assert!(!is_error, "{result}");
+    assert_eq!(result["count"], 0);
+    bridge.shutdown();
+    // A server that does not advertise the provider gets the typed
+    // unsupported error instead — the two answers never blur.
+    let dir = temp_dir("code-actions-unsupported");
+    let ws = make_workspace(&dir);
+    let config = write_fake_config(&dir, "normal", "", &[]);
+    let mut bridge = Bridge::spawn(&config);
+    let (is_error, result) = bridge.call_tool("code_actions", hover_args(&ws));
+    assert!(is_error, "{result}");
+    assert_eq!(Bridge::error_code(&result), "UnsupportedMethod");
     bridge.shutdown();
 }
 

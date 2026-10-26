@@ -362,6 +362,51 @@ impl Fake {
                 );
                 true
             }
+            "textDocument/codeAction" => {
+                let start_line = params
+                    .get("range")
+                    .and_then(|r| r.get("start"))
+                    .and_then(|s| s.get("line"))
+                    .and_then(serde_json::Value::as_u64)
+                    .unwrap_or(0);
+                if start_line == 99 {
+                    // A region with no actions: a valid empty list.
+                    respond(writer, id, serde_json::json!([]));
+                    return true;
+                }
+                let root = self.root_uri.clone();
+                respond(
+                    writer,
+                    id,
+                    serde_json::json!([
+                        {"title": "Zulu refactor", "kind": "refactor.extract"},
+                        {
+                            "title": "Fix the thing",
+                            "kind": "quickfix",
+                            "edit": {"changes": {format!("{root}/src/lib.rs"): [{
+                                "range": range(1, 0, 1, 5),
+                                "newText": "PAYLOAD-MARKER-EDIT"
+                            }]}},
+                            "command": {
+                                "title": "apply",
+                                "command": "secret.command.id",
+                                "arguments": ["PAYLOAD-MARKER-COMMAND"]
+                            }
+                        },
+                        {
+                            "title": "Legacy command",
+                            "command": "legacy.cmd",
+                            "arguments": []
+                        },
+                        {
+                            "title": "Alphabet fix",
+                            "kind": "source.fixAll",
+                            "command": {"title": "c", "command": "fix.all"}
+                        }
+                    ]),
+                );
+                true
+            }
             "textDocument/documentSymbol" => {
                 respond(
                     writer,

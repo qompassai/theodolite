@@ -12,13 +12,13 @@ use crate::config::Config;
 use crate::errors::{BridgeError, BridgeResult};
 use crate::session::{Session, SessionManager, resolve_within, validate_workspace};
 use crate::shaping::{
-    Diagnostic, Location, MAX_RESULT_BYTES, diagnostic_json, enforce_budget, location_json,
-    merge_diagnostics, parse_range, path_to_uri, range_json, relativize_uri, sort_diagnostics,
-    sort_locations, uri_to_path,
+    Diagnostic, Location, MAX_RESULT_BYTES, Position, Range, diagnostic_json, diagnostic_to_lsp,
+    enforce_budget, location_json, merge_diagnostics, parse_range, path_to_uri, range_json,
+    relativize_uri, sort_diagnostics, sort_locations, uri_to_path,
 };
 
 /// Tool names registered, in registration order.
-pub const TOOL_NAMES: [&str; 11] = [
+pub const TOOL_NAMES: [&str; 12] = [
     "session_status",
     "diagnostics",
     "hover",
@@ -29,6 +29,7 @@ pub const TOOL_NAMES: [&str; 11] = [
     "references",
     "document_symbols",
     "workspace_symbols",
+    "code_actions",
     "session_restart",
 ];
 
@@ -146,6 +147,25 @@ pub fn tool_definitions() -> serde_json::Value {
             &["workspace", "server", "query"],
         ),
         tool(
+            "code_actions",
+            "LIST the code actions a server offers for a range: title, kind, and whether \
+             each carries an edit or a command. The edit/command payloads are never \
+             returned and never executed — this listing is the read half the gated \
+             mutation class will one day consume. Typed UnsupportedMethod when the \
+             server does not advertise code-action support; an empty list is a valid, \
+             distinct answer.",
+            serde_json::json!({
+                "workspace": workspace, "server": server, "path": path,
+                "line": {"type": "integer", "minimum": 0},
+                "character": {"type": "integer", "minimum": 0},
+                "end_line": {"type": "integer", "minimum": 0,
+                    "description": "Range end line; defaults to `line` (a point range)."},
+                "end_character": {"type": "integer", "minimum": 0,
+                    "description": "Range end character; defaults to `character`."}
+            }),
+            &["workspace", "server", "path", "line", "character"],
+        ),
+        tool(
             "session_restart",
             "The only respawn path: tears down the (workspace, server) session and starts a fresh one.",
             serde_json::json!({"workspace": workspace, "server": server}),
@@ -176,6 +196,7 @@ pub fn call_tool(
         "references" => tool_references(manager, arguments),
         "document_symbols" => tool_document_symbols(manager, arguments),
         "workspace_symbols" => tool_workspace_symbols(manager, arguments),
+        "code_actions" => tool_code_actions(manager, arguments),
         "session_restart" => tool_session_restart(manager, arguments),
         other => Err(BridgeError::UnsupportedMethod {
             detail: format!("no tool named {other:?} is registered in v1"),
@@ -734,6 +755,151 @@ fn tool_workspace_symbols(
     let result = serde_json::json!({"count": items.len(), "symbols": items});
     enforce_budget(&result, symbols.len(), MAX_RESULT_BYTES)?;
     Ok(result)
+}
+
+/// One listed code action (P3 item 4): the offer's identity and
+/// payload *presence* — never the payload. Presence is what P5's
+/// gated apply will need to mint handles against; content stays in
+/// the server until then.
+#[derive(Debug, PartialEq, Eq)]
+struct ActionSummary {
+    title: String,
+    kind: String,
+    has_edit: bool,
+    has_command: bool,
+}
+
+fn tool_code_actions(
+    manager: &SessionManager,
+    arguments: &serde_json::Value,
+) -> BridgeResult<serde_json::Value> {
+    let (session, _) = session_for(manager, arguments)?;
+    let raw_path = require_string(arguments, "path")?;
+    let absolute = resolve_within(&session.workspace_root, &raw_path)?;
+    session.ensure_ready(manager.config())?;
+    if !session.capability_advertised("codeActionProvider") {
+        return Err(BridgeError::UnsupportedMethod {
+            detail: format!(
+                "server {} does not advertise codeActionProvider; code actions are \
+                 unavailable, not empty",
+                session.entry.id
+            ),
+        });
+    }
+    let (uri, _) = session.sync_file(&absolute)?;
+    let line = require_u64(arguments, "line")?;
+    let character = require_u64(arguments, "character")?;
+    let end_line = arguments
+        .get("end_line")
+        .and_then(serde_json::Value::as_u64)
+        .unwrap_or(line);
+    let end_character = arguments
+        .get("end_character")
+        .and_then(serde_json::Value::as_u64)
+        .unwrap_or(character);
+    let range = Range {
+        start: Position { line, character },
+        end: Position {
+            line: end_line,
+            character: end_character,
+        },
+    };
+    if range.end < range.start {
+        return Err(BridgeError::InvalidArgument {
+            detail: "range end precedes range start".to_string(),
+        });
+    }
+    // The protocol's context: the file's diagnostics overlapping the
+    // range, in wire shape. Servers key quickfix offers off these
+    // (a type error's fix exists only relative to its diagnostic),
+    // so they are part of the request, not an embellishment.
+    let context_diagnostics: Vec<serde_json::Value> = session
+        .diagnostics(manager.config(), Some(&uri))?
+        .iter()
+        .filter(|diagnostic| ranges_overlap(diagnostic.range, range))
+        .map(diagnostic_to_lsp)
+        .collect();
+    let raw = session.request(
+        "textDocument/codeAction",
+        serde_json::json!({
+            "textDocument": {"uri": uri},
+            "range": range_json(range),
+            "context": {"diagnostics": context_diagnostics}
+        }),
+        manager.config().request_timeout_ms,
+    )?;
+    let mut actions: Vec<ActionSummary> = Vec::new();
+    if let Some(entries) = raw.as_array() {
+        for entry in entries {
+            actions.push(summarize_action(entry));
+        }
+    }
+    actions.sort_by(|a, b| {
+        a.title
+            .cmp(&b.title)
+            .then(a.kind.cmp(&b.kind))
+            .then(a.has_edit.cmp(&b.has_edit))
+            .then(a.has_command.cmp(&b.has_command))
+    });
+    actions.dedup();
+    let items: Vec<serde_json::Value> = actions
+        .iter()
+        .map(|action| {
+            serde_json::json!({
+                "title": action.title,
+                "kind": action.kind,
+                "has_edit": action.has_edit,
+                "has_command": action.has_command,
+            })
+        })
+        .collect();
+    let result = serde_json::json!({"count": items.len(), "actions": items});
+    enforce_budget(&result, actions.len(), MAX_RESULT_BYTES)?;
+    Ok(result)
+}
+
+/// Whether two ranges overlap; a point range overlaps a diagnostic
+/// that touches the point (inclusive on both ends, since a caret
+/// sits *between* characters and servers expect the diagnostics at
+/// the caret to be in context).
+fn ranges_overlap(a: Range, b: Range) -> bool {
+    if a.start == a.end || b.start == b.end {
+        let (point, span) = if a.start == a.end { (a, b) } else { (b, a) };
+        return span.start <= point.start && point.start <= span.end;
+    }
+    a.start < b.end && b.start < a.end
+}
+
+/// Reduce one wire code-action entry (a `CodeAction` or a bare
+/// `Command`) to its listing summary. The edit and command values
+/// are inspected for presence only and dropped here — this is the
+/// single place payloads could leak, and they do not leave it.
+fn summarize_action(entry: &serde_json::Value) -> ActionSummary {
+    let title = entry
+        .get("title")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or_default()
+        .to_string();
+    // A bare Command carries `command` as a string and has no kind
+    // or edit of its own.
+    if entry.get("command").is_some_and(serde_json::Value::is_string) {
+        return ActionSummary {
+            title,
+            kind: String::new(),
+            has_edit: false,
+            has_command: true,
+        };
+    }
+    ActionSummary {
+        title,
+        kind: entry
+            .get("kind")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_default()
+            .to_string(),
+        has_edit: entry.get("edit").is_some_and(|edit| !edit.is_null()),
+        has_command: entry.get("command").is_some_and(|cmd| !cmd.is_null()),
+    }
 }
 
 fn tool_session_restart(
