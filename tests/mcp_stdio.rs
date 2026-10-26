@@ -414,6 +414,35 @@ fn definition_family_tools_shape_and_sort() {
 }
 
 #[test]
+fn workspace_symbols_are_sorted_across_files() {
+    let dir = temp_dir("workspace-symbols");
+    let ws = make_workspace(&dir);
+    let config = write_fake_config(&dir, "rich", "", &[]);
+    let mut bridge = Bridge::spawn(&config);
+    let (is_error, result) = bridge.call_tool(
+        "workspace_symbols",
+        serde_json::json!({
+            "workspace": ws.to_string_lossy(), "server": "fake", "query": "alpha"
+        }),
+    );
+    assert!(!is_error, "{result}");
+    assert_eq!(result["count"], 3);
+    // The fake scrambles (other.rs first); the bridge sorts by the
+    // SPEC §4.3 symbol key (uri, range, name, kind).
+    let names: Vec<&str> = result["symbols"]
+        .as_array()
+        .expect("symbols array")
+        .iter()
+        .map(|s| s["name"].as_str().unwrap_or(""))
+        .collect();
+    assert_eq!(names, vec!["alpha_fn", "alpha_type", "beta_fn"]);
+    assert_eq!(result["symbols"][0]["uri"], "file:///src/lib.rs");
+    assert_eq!(result["symbols"][0]["container"], "mod_a");
+    assert_eq!(result["symbols"][2]["uri"], "file:///src/other.rs");
+    bridge.shutdown();
+}
+
+#[test]
 fn session_restart_returns_a_fresh_transcript() {
     let dir = temp_dir("restart-ok");
     let ws = make_workspace(&dir);
@@ -719,6 +748,7 @@ fn mutation_tools_are_absent_and_unregistered() {
             "implementation",
             "references",
             "document_symbols",
+            "workspace_symbols",
             "session_restart"
         ]
     );
@@ -793,6 +823,44 @@ fn fifth_session_key_is_a_loud_error_not_an_eviction() {
     let (is_error, result) = bridge.call_tool("hover", hover_args(&workspaces[4]));
     assert!(is_error, "{result}");
     assert_eq!(Bridge::error_code(&result), "SessionLimit");
+    bridge.shutdown();
+}
+
+#[test]
+fn workspace_symbols_over_budget_reports_true_count() {
+    let dir = temp_dir("workspace-symbols-budget");
+    let ws = make_workspace(&dir);
+    let config = write_fake_config(&dir, "rich", "", &[]);
+    let mut bridge = Bridge::spawn(&config);
+    let (is_error, result) = bridge.call_tool(
+        "workspace_symbols",
+        serde_json::json!({
+            "workspace": ws.to_string_lossy(), "server": "fake", "query": "many"
+        }),
+    );
+    assert!(is_error, "{result}");
+    // Typed overflow with the true count — not a truncated list.
+    assert_eq!(Bridge::error_code(&result), "ResultTooLarge");
+    assert_eq!(result["error"]["items"], 1500);
+    assert_eq!(result["error"]["budget_bytes"], 65_536);
+    assert!(result.get("symbols").is_none(), "partial payload leaked");
+    bridge.shutdown();
+}
+
+#[test]
+fn workspace_symbols_unsupported_is_typed() {
+    let dir = temp_dir("workspace-symbols-unsupported");
+    let ws = make_workspace(&dir);
+    let config = write_fake_config(&dir, "normal", "", &[]);
+    let mut bridge = Bridge::spawn(&config);
+    let (is_error, result) = bridge.call_tool(
+        "workspace_symbols",
+        serde_json::json!({
+            "workspace": ws.to_string_lossy(), "server": "fake", "query": ""
+        }),
+    );
+    assert!(is_error, "{result}");
+    assert_eq!(Bridge::error_code(&result), "UnsupportedMethod");
     bridge.shutdown();
 }
 

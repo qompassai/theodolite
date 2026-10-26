@@ -305,6 +305,63 @@ impl Fake {
                 );
                 true
             }
+            "workspace/symbol" => {
+                let query = params
+                    .get("query")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or_default();
+                let root = self.root_uri.clone();
+                if query == "many" {
+                    // Budget stress: 1 500 symbols — well past the
+                    // 64 KiB shaped-result budget.
+                    let many: Vec<serde_json::Value> = (0..1500u64)
+                        .map(|line| {
+                            serde_json::json!({
+                                "name": format!("symbol_{line}"),
+                                "kind": 6,
+                                "location": {
+                                    "uri": format!("{root}/src/lib.rs"),
+                                    "range": range(line, 0, line, 7)
+                                },
+                                "containerName": "stress"
+                            })
+                        })
+                        .collect();
+                    respond(writer, id, serde_json::Value::Array(many));
+                    return true;
+                }
+                respond(
+                    writer,
+                    id,
+                    serde_json::json!([
+                        {
+                            "name": "beta_fn", "kind": 12,
+                            "location": {
+                                "uri": format!("{root}/src/other.rs"),
+                                "range": range(3, 0, 3, 7)
+                            },
+                            "containerName": ""
+                        },
+                        {
+                            "name": "alpha_fn", "kind": 12,
+                            "location": {
+                                "uri": format!("{root}/src/lib.rs"),
+                                "range": range(1, 0, 1, 8)
+                            },
+                            "containerName": "mod_a"
+                        },
+                        {
+                            "name": "alpha_type", "kind": 5,
+                            "location": {
+                                "uri": format!("{root}/src/lib.rs"),
+                                "range": range(9, 0, 9, 10)
+                            },
+                            "containerName": ""
+                        }
+                    ]),
+                );
+                true
+            }
             "textDocument/documentSymbol" => {
                 respond(
                     writer,

@@ -18,7 +18,7 @@ use crate::shaping::{
 };
 
 /// Tool names registered, in registration order.
-pub const TOOL_NAMES: [&str; 10] = [
+pub const TOOL_NAMES: [&str; 11] = [
     "session_status",
     "diagnostics",
     "hover",
@@ -28,6 +28,7 @@ pub const TOOL_NAMES: [&str; 10] = [
     "implementation",
     "references",
     "document_symbols",
+    "workspace_symbols",
     "session_restart",
 ];
 
@@ -133,6 +134,18 @@ pub fn tool_definitions() -> serde_json::Value {
             &["workspace", "server", "path"],
         ),
         tool(
+            "workspace_symbols",
+            "Workspace-wide symbol search. Results are the server's own (no client-side \
+             name filtering), sorted per the canonical symbol key, byte-bounded: overflow \
+             is a typed ResultTooLarge carrying the true count. Typed UnsupportedMethod \
+             when the server does not advertise workspace-symbol support.",
+            serde_json::json!({
+                "workspace": workspace, "server": server,
+                "query": {"type": "string", "description": "Query string passed to the server verbatim; may be empty."}
+            }),
+            &["workspace", "server", "query"],
+        ),
+        tool(
             "session_restart",
             "The only respawn path: tears down the (workspace, server) session and starts a fresh one.",
             serde_json::json!({"workspace": workspace, "server": server}),
@@ -162,6 +175,7 @@ pub fn call_tool(
         }
         "references" => tool_references(manager, arguments),
         "document_symbols" => tool_document_symbols(manager, arguments),
+        "workspace_symbols" => tool_workspace_symbols(manager, arguments),
         "session_restart" => tool_session_restart(manager, arguments),
         other => Err(BridgeError::UnsupportedMethod {
             detail: format!("no tool named {other:?} is registered in v1"),
@@ -621,6 +635,104 @@ fn tool_document_symbols(
         "symbols": items,
     });
     enforce_budget(&result, flat.len(), MAX_RESULT_BYTES)?;
+    Ok(result)
+}
+
+/// One workspace symbol, flattened from either the
+/// `SymbolInformation` or the `WorkspaceSymbol` wire shape.
+#[derive(Debug)]
+struct WorkspaceSymbol {
+    name: String,
+    kind: u64,
+    container: String,
+    uri: String,
+    range: crate::shaping::Range,
+}
+
+fn tool_workspace_symbols(
+    manager: &SessionManager,
+    arguments: &serde_json::Value,
+) -> BridgeResult<serde_json::Value> {
+    let (session, _) = session_for(manager, arguments)?;
+    let query = require_string(arguments, "query")?;
+    session.ensure_ready(manager.config())?;
+    if !session.capability_advertised("workspaceSymbolProvider") {
+        return Err(BridgeError::UnsupportedMethod {
+            detail: format!(
+                "server {} does not advertise workspaceSymbolProvider; workspace/symbol is \
+                 unavailable, not empty",
+                session.entry.id
+            ),
+        });
+    }
+    let raw = session.request(
+        "workspace/symbol",
+        serde_json::json!({"query": query}),
+        manager.config().request_timeout_ms,
+    )?;
+    let mut symbols: Vec<WorkspaceSymbol> = Vec::new();
+    if let Some(items) = raw.as_array() {
+        for item in items {
+            let Some(location) = item.get("location") else {
+                continue;
+            };
+            let uri_raw = location
+                .get("uri")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or_default();
+            if uri_raw.is_empty() {
+                continue;
+            }
+            symbols.push(WorkspaceSymbol {
+                name: item
+                    .get("name")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or_default()
+                    .to_string(),
+                kind: item
+                    .get("kind")
+                    .and_then(serde_json::Value::as_u64)
+                    .unwrap_or(0),
+                container: item
+                    .get("containerName")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or_default()
+                    .to_string(),
+                uri: relativize_uri(uri_raw, &session.workspace_root)?,
+                range: parse_range(location.get("range").unwrap_or(&serde_json::Value::Null)),
+            });
+        }
+    }
+    // SPEC §4.3 symbol key: (uri, range, name, kind).
+    symbols.sort_by(|a, b| {
+        a.uri
+            .cmp(&b.uri)
+            .then(a.range.cmp(&b.range))
+            .then(a.name.cmp(&b.name))
+            .then(a.kind.cmp(&b.kind))
+            .then(a.container.cmp(&b.container))
+    });
+    symbols.dedup_by(|next, kept| {
+        next.uri == kept.uri
+            && next.range == kept.range
+            && next.name == kept.name
+            && next.kind == kept.kind
+            && next.container == kept.container
+    });
+    let items: Vec<serde_json::Value> = symbols
+        .iter()
+        .map(|symbol| {
+            serde_json::json!({
+                "name": symbol.name,
+                "kind": symbol.kind,
+                "container": symbol.container,
+                "uri": symbol.uri,
+                "range": range_json(symbol.range),
+            })
+        })
+        .collect();
+    let result = serde_json::json!({"count": items.len(), "symbols": items});
+    enforce_budget(&result, symbols.len(), MAX_RESULT_BYTES)?;
     Ok(result)
 }
 
