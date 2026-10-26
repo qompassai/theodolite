@@ -32,7 +32,32 @@ pub fn with_warning() -> bool {
     let value = 1;
     value == 1
 }
+
+pub fn broken() -> u32 {
+    "not a number"
+}
 "#;
+
+/// The `initializationOptions` Diver's own bacon-ls config passes
+/// (lsp/bacon_ls.lua in the diver repo). Without them bacon-ls stays
+/// in its degraded mode: it answers initialize, publishes one empty
+/// diagnostics set, and never runs its backend — a bare client sees
+/// an empty, quiet server. Both sides of the gate use these verbatim
+/// so the comparison covers the server's real operating mode.
+fn bacon_initialization_options() -> serde_json::Value {
+    serde_json::json!({
+        "createBaconPreferencesFile": true,
+        "locationsFile": ".bacon-locations",
+        "runBaconInBackground": true,
+        "runBaconInBackgroundCommandArguments": "--headless -j bacon-ls",
+        "synchronizeAllOpenFilesWaitMillis": 2000,
+        "updateOnChange": true,
+        "updateOnSave": true,
+        "updateOnSaveWaitMillis": 1000,
+        "useBaconBackend": true,
+        "validateBaconPreferences": true
+    })
+}
 
 fn find_bacon_ls() -> Option<PathBuf> {
     if let Ok(explicit) = std::env::var("THEODOLITE_BACON_LS") {
@@ -83,7 +108,7 @@ fn make_fixture(dir: &Path) -> PathBuf {
 struct DirectClient {
     child: Child,
     stdin: ChildStdin,
-    stdout: BufReader<ChildStdout>,
+    messages: std::sync::mpsc::Receiver<theodolite::errors::BridgeResult<Option<LspMessage>>>,
     next_id: i64,
     diagnostics: Vec<Diagnostic>,
     generation: u64,
@@ -99,11 +124,28 @@ impl DirectClient {
             .spawn()
             .expect("spawn standalone bacon-ls");
         let stdin = child.stdin.take().expect("stdin");
-        let stdout = BufReader::new(child.stdout.take().expect("stdout"));
+        // Reader thread: `read_message` is a plain blocking read with
+        // no timeout, so deadlines can only be honored by receiving
+        // with a timeout. (The first primo run of this harness hung
+        // 44 minutes at exactly this spot: the settle loop's deadline
+        // was only consulted between messages, and a quiet server
+        // never produced another one.)
+        let stdout = child.stdout.take().expect("stdout");
+        let (sender, receiver) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let mut reader = BufReader::new(stdout);
+            loop {
+                let item = read_message(&mut reader, "bacon-ls");
+                let terminal = matches!(item, Ok(None) | Err(_));
+                if sender.send(item).is_err() || terminal {
+                    break;
+                }
+            }
+        });
         DirectClient {
             child,
             stdin,
-            stdout,
+            messages: receiver,
             next_id: 0,
             diagnostics: Vec::new(),
             generation: 0,
@@ -116,10 +158,15 @@ impl DirectClient {
 
     fn pump_until(&mut self, want_id: Option<i64>, deadline: Instant) -> Option<serde_json::Value> {
         loop {
-            if Instant::now() >= deadline {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
                 return None;
             }
-            match read_message(&mut self.stdout, "bacon-ls") {
+            let item = match self.messages.recv_timeout(remaining) {
+                Ok(item) => item,
+                Err(_) => return None,
+            };
+            match item {
                 Ok(Some(LspMessage::Response { id, result })) => {
                     if want_id == Some(id) {
                         return Some(result.ok().unwrap_or(serde_json::Value::Null));
@@ -188,12 +235,35 @@ fn standalone_diagnostics(binary: &Path, workspace: &Path) -> Vec<Diagnostic> {
     let mut client = DirectClient::spawn(binary, workspace);
     client.next_id += 1;
     let root_uri = theodolite::shaping::path_to_uri(workspace);
+    // The initialize params mirror the bridge's own (session.rs):
+    // an earlier harness revision sent a bare rootUri-only request
+    // and bacon-ls never published real diagnostics to it — it
+    // answers, syncs one empty set, and stays quiet. The comparison
+    // is only meaningful when both clients present the same shape.
+    let name = workspace
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_default();
     client.send(&serde_json::json!({
         "jsonrpc": "2.0", "id": client.next_id, "method": "initialize",
         "params": {
             "processId": null, "rootUri": root_uri,
-            "capabilities": {"textDocument": {"publishDiagnostics": {}}},
-            "clientInfo": {"name": "theodolite-parity-harness", "version": "0.1.0"}
+            "workspaceFolders": [{"uri": root_uri, "name": name}],
+            "capabilities": {
+                "textDocument": {
+                    "synchronization": {"didSave": false},
+                    "publishDiagnostics": {"relatedInformation": false},
+                    "hover": {"contentFormat": ["markdown", "plaintext"]},
+                    "definition": {},
+                    "references": {},
+                    "documentSymbol": {"hierarchicalDocumentSymbolSupport": true}
+                },
+                "window": {"workDoneProgress": true},
+                "experimental": {"serverStatusNotification": true}
+            },
+            "clientInfo": {"name": "theodolite-parity-harness", "version": "0.1.0"},
+            "trace": "off",
+            "initializationOptions": bacon_initialization_options()
         }
     }));
     let deadline = Instant::now() + Duration::from_secs(60);
@@ -209,15 +279,28 @@ fn standalone_diagnostics(binary: &Path, workspace: &Path) -> Vec<Diagnostic> {
             "languageId": "rust", "version": 1, "text": text
         }}
     }));
-    // Settle: generation stable across two pumps 250 ms apart.
-    let deadline = Instant::now() + Duration::from_secs(120);
-    let mut last_generation: Option<u64> = None;
+    // Settle: bacon-ls publishes an empty set immediately, then the
+    // real set only after its background backend has run (Diver's
+    // init options carry a 2 s synchronize wait plus job time), so
+    // a short stability window fires during the startup gap — the
+    // naive-quiescence trap. Require a minimum observation period
+    // after didOpen, then a full 2 s with no generation change.
+    let opened_at = Instant::now();
+    let deadline = opened_at + Duration::from_secs(120);
+    let mut last_generation = client.generation;
+    let mut last_change = Instant::now();
     loop {
-        let _ = client.pump_until(None, Instant::now() + Duration::from_millis(250));
-        if last_generation == Some(client.generation) && client.generation > 0 {
+        let _ = client.pump_until(None, Instant::now() + Duration::from_millis(500));
+        if client.generation != last_generation {
+            last_generation = client.generation;
+            last_change = Instant::now();
+        }
+        if client.generation > 0
+            && opened_at.elapsed() >= Duration::from_secs(6)
+            && last_change.elapsed() >= Duration::from_secs(2)
+        {
             break;
         }
-        last_generation = Some(client.generation);
         assert!(
             Instant::now() < deadline,
             "standalone bacon-ls diagnostics never settled"
@@ -257,6 +340,74 @@ fn parity_gate_bridge_diagnostics_equal_standalone_bacon_ls() {
     std::fs::create_dir_all(&dir).expect("mkdir parity dir");
     let ws = make_fixture(&dir);
 
+    // Warm the fixture (measured behavior, primo 2026-10-26):
+    // bacon-ls publishes, on open, the state of its `.bacon-locations`
+    // file. On a cold directory the background backend computes the
+    // real results into that file but the LSP does not republish them
+    // to the already-open session (in editor use, the next edit/save
+    // cycle republishes). A cold standalone client therefore sees an
+    // empty set while any client opening the warmed directory sees
+    // the full set — the gate compares two shapings of one server
+    // truth, so both sides must observe the same server state. One
+    // throwaway session brings the backend's first run to completion;
+    // both measured sides then start fresh against the warmed dir.
+    {
+        let mut warm = DirectClient::spawn(&binary, &ws);
+        warm.next_id += 1;
+        let root_uri = theodolite::shaping::path_to_uri(&ws);
+        let name = ws
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        warm.send(&serde_json::json!({
+            "jsonrpc": "2.0", "id": warm.next_id, "method": "initialize",
+            "params": {
+                "processId": null, "rootUri": root_uri,
+                "workspaceFolders": [{"uri": root_uri, "name": name}],
+                "capabilities": {"textDocument": {"publishDiagnostics": {}}},
+                "clientInfo": {"name": "theodolite-parity-warmup", "version": "0.1.0"},
+                "initializationOptions": bacon_initialization_options()
+            }
+        }));
+        let init_deadline = Instant::now() + Duration::from_secs(60);
+        assert!(
+            warm.pump_until(Some(warm.next_id), init_deadline).is_some(),
+            "warm-up bacon-ls never answered initialize"
+        );
+        warm.send(&serde_json::json!({"jsonrpc": "2.0", "method": "initialized", "params": {}}));
+        let file = ws.join("src/lib.rs");
+        let text = std::fs::read_to_string(&file).expect("read fixture lib");
+        warm.send(&serde_json::json!({
+            "jsonrpc": "2.0", "method": "textDocument/didOpen",
+            "params": {"textDocument": {
+                "uri": theodolite::shaping::path_to_uri(&file),
+                "languageId": "rust", "version": 1, "text": text
+            }}
+        }));
+        let locations = ws.join(".bacon-locations");
+        let warm_deadline = Instant::now() + Duration::from_secs(120);
+        loop {
+            let _ = warm.pump_until(None, Instant::now() + Duration::from_millis(500));
+            let computed = std::fs::read_to_string(&locations)
+                .map(|text| text.contains("mismatched types"))
+                .unwrap_or(false);
+            if computed {
+                break;
+            }
+            assert!(
+                Instant::now() < warm_deadline,
+                "bacon backend never computed the fixture diagnostics"
+            );
+        }
+        warm.next_id += 1;
+        warm.send(&serde_json::json!({
+            "jsonrpc": "2.0", "id": warm.next_id, "method": "shutdown", "params": null
+        }));
+        let _ = warm.pump_until(Some(warm.next_id), Instant::now() + Duration::from_secs(10));
+        warm.send(&serde_json::json!({"jsonrpc": "2.0", "method": "exit", "params": null}));
+        let _ = warm.child.wait();
+    }
+
     // Side A: bacon-ls driven standalone.
     let mut standalone = standalone_diagnostics(&binary, &ws);
     for diagnostic in &mut standalone {
@@ -276,7 +427,13 @@ fn parity_gate_bridge_diagnostics_equal_standalone_bacon_ls() {
              version_probe = [\"--version\"]\nexpect_version = \"{version}\"\n\
              languages = [\"rust\"]\nextensions = [\"rs\"]\n\
              language_ids = {{ rs = \"rust\" }}\nreadiness = \"immediate\"\n\
-             diagnostics_owner = true\n",
+             diagnostics_owner = true\n\
+             initialization_options = {{ createBaconPreferencesFile = true, \
+             locationsFile = \".bacon-locations\", runBaconInBackground = true, \
+             runBaconInBackgroundCommandArguments = \"--headless -j bacon-ls\", \
+             synchronizeAllOpenFilesWaitMillis = 2000, updateOnChange = true, \
+             updateOnSave = true, updateOnSaveWaitMillis = 1000, \
+             useBaconBackend = true, validateBaconPreferences = true }}\n",
             binary.display()
         ),
     )
