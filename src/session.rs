@@ -80,6 +80,19 @@ struct Inner {
     /// bridges lose).
     saw_activity: bool,
     documents: HashMap<String, OpenDocument>,
+    /// Settle evidence (P4 item 2): one session-wide event sequence,
+    /// stamped when the bridge actually sends a document sync and
+    /// when an evidence-bearing notification arrives, so "a publish
+    /// exists that postdates the last sync" is a comparison instead
+    /// of a guess about server timing.
+    event_seq: u64,
+    doc_sync_seq: HashMap<String, u64>,
+    doc_publish_seq: HashMap<String, u64>,
+    last_publish_seq: u64,
+    last_sync_seq: u64,
+    last_progress_end_seq: u64,
+    last_quiescent_seq: u64,
+    progress_completed: u64,
     /// The server's advertised capabilities, captured verbatim from
     /// the `initialize` result (P3). Feature support is read from
     /// this, never probed by trial request: an unadvertised feature
@@ -112,6 +125,14 @@ impl SessionState {
                 server_status_quiescent: None,
                 saw_activity: false,
                 documents: HashMap::new(),
+                event_seq: 0,
+                doc_sync_seq: HashMap::new(),
+                doc_publish_seq: HashMap::new(),
+                last_publish_seq: 0,
+                last_sync_seq: 0,
+                last_progress_end_seq: 0,
+                last_quiescent_seq: 0,
+                progress_completed: 0,
                 server_capabilities: serde_json::Value::Null,
                 stderr_ring: VecDeque::new(),
                 exit_status: None,
@@ -136,6 +157,18 @@ impl SessionState {
         if !matches!(inner.phase, Phase::Dead(_)) {
             inner.phase = Phase::Dead(detail);
         }
+    }
+
+    /// Stamp a document-sync event: the bridge is about to send a
+    /// didOpen/didChange/didClose for `uri` (P4 item 2). Only actual
+    /// sends are stamped; an unchanged-content re-sync sends nothing
+    /// and stamps nothing.
+    fn note_sync(&self, uri: &str) {
+        let mut inner = self.lock();
+        inner.event_seq += 1;
+        let seq = inner.event_seq;
+        inner.doc_sync_seq.insert(uri.to_string(), seq);
+        inner.last_sync_seq = seq;
     }
 
     fn record_violation(&self, what: String) {
@@ -460,6 +493,7 @@ impl Session {
         if metadata.is_err() {
             let was_open = self.state.lock().documents.remove(&key).is_some();
             if was_open {
+                self.state.note_sync(&uri);
                 self.notify(
                     "textDocument/didClose",
                     serde_json::json!({"textDocument": {"uri": uri}}),
@@ -479,6 +513,7 @@ impl Session {
             Some(doc) => {
                 let version = doc.version + 1;
                 let text = String::from_utf8_lossy(&content).into_owned();
+                self.state.note_sync(&uri);
                 self.notify(
                     "textDocument/didChange",
                     serde_json::json!({
@@ -513,6 +548,7 @@ impl Session {
                         ),
                     })?;
                 let text = String::from_utf8_lossy(&content).into_owned();
+                self.state.note_sync(&uri);
                 self.notify(
                     "textDocument/didOpen",
                     serde_json::json!({
@@ -536,14 +572,50 @@ impl Session {
 
     /// Diagnostics for the whole workspace, or one file when
     /// `only_uri` is given, from the push accumulation. Waits for the
-    /// settle predicate first (SPEC §6): no in-flight progress and a
-    /// diagnostics generation stable across two polls.
+    /// settle predicate first (SPEC section 6 as revisited by P4
+    /// item 2): stability AND post-sync evidence — see
+    /// `wait_diagnostics_settled`.
     pub fn diagnostics(
         &self,
         config: &Config,
         only_uri: Option<&str>,
     ) -> BridgeResult<Vec<Diagnostic>> {
-        self.wait_diagnostics_settled(config)?;
+        self.wait_diagnostics_settled(config, only_uri)?;
+        Ok(self.collect_diagnostics(only_uri))
+    }
+
+    /// The push accumulation for an advisory consumer that feeds it
+    /// back to the server itself (the code-action request context).
+    /// NOT the settling read: the full evidence predicate would
+    /// park this for a whole ready timeout — and fail the call — on
+    /// any server whose evidence arrives late or never, where v1
+    /// served the call fine (P4 item 2 judgment call). Instead this
+    /// waits only for reader-thread catch-up: the diagnostics
+    /// generation stable across two polls, bounded by
+    /// CONTEXT_DRAIN_MAX_MS, and it never fails — a server that
+    /// stays silent yields the (empty) accumulation as it stands,
+    /// which the server itself can only improve on.
+    pub fn diagnostics_context(&self, only_uri: Option<&str>) -> Vec<Diagnostic> {
+        let deadline = Instant::now() + Duration::from_millis(CONTEXT_DRAIN_MAX_MS);
+        let mut last_generation: Option<u64> = None;
+        loop {
+            if matches!(self.state.phase(), Phase::Dead(_)) {
+                break;
+            }
+            let generation = self.state.lock().diagnostics_generation;
+            if last_generation == Some(generation) {
+                break;
+            }
+            last_generation = Some(generation);
+            if Instant::now() >= deadline {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(SETTLE_POLL_MS));
+        }
+        self.collect_diagnostics(only_uri)
+    }
+
+    fn collect_diagnostics(&self, only_uri: Option<&str>) -> Vec<Diagnostic> {
         let inner = self.state.lock();
         let mut collected: Vec<Diagnostic> = Vec::new();
         for (uri, diagnostics) in inner.diagnostics.iter() {
@@ -552,7 +624,7 @@ impl Session {
             }
             collected.extend(diagnostics.iter().cloned());
         }
-        Ok(collected)
+        collected
     }
 
     /// Whether the server advertised a capability in its
@@ -604,8 +676,41 @@ impl Session {
         Ok(diagnostics_from_lsp(uri, &items, DiagnosticChannel::Pull))
     }
 
-    fn wait_diagnostics_settled(&self, config: &Config) -> BridgeResult<()> {
+    /// The settle predicate (SPEC section 6, revisited in P4
+    /// item 2). The v1 predicate — no in-flight progress and a
+    /// diagnostics generation stable across two polls — fired at
+    /// generation 0 for lua-language-server, whose first real
+    /// publish lands ~1.6 s after didOpen (P2-REPORT Finding 3;
+    /// timings measured again for P4). Stability alone cannot
+    /// distinguish "the server has answered" from "the server has
+    /// not answered yet", so the predicate is now stability AND
+    /// evidence, where evidence is protocol-shaped only (no server
+    /// names anywhere in this file's logic):
+    ///
+    /// - a `publishDiagnostics` for the scoped document (or any
+    ///   document, unscoped) that postdates that document's last
+    ///   sync, or
+    /// - a `$/progress` completion that postdates the last sync, or
+    /// - a `serverStatus` quiescent=true report that postdates the
+    ///   last sync and follows observed activity, or
+    /// - an advertised pull channel (`diagnosticProvider`): the
+    ///   caller's synchronous pull immediately after this wait IS
+    ///   the evidence channel for such servers (rust-analyzer
+    ///   publishes nothing at all for a clean file), and the wait
+    ///   then only drains in-flight push traffic.
+    ///
+    /// The vacuous case: no document was ever synced in this
+    /// session, so no publish is owed and stability alone settles.
+    /// A server offering none of these surfaces never settles and
+    /// the call fails with the typed `ServerNotReady` at the ready
+    /// deadline — a loud error in place of a confident empty set.
+    fn wait_diagnostics_settled(
+        &self,
+        config: &Config,
+        only_uri: Option<&str>,
+    ) -> BridgeResult<()> {
         let deadline = Instant::now() + Duration::from_millis(config.ready_timeout_ms);
+        let pull_advertised = self.supports_pull_diagnostics();
         let mut last_generation: Option<u64> = None;
         loop {
             if let Phase::Dead(detail) = self.state.phase() {
@@ -614,18 +719,29 @@ impl Session {
                     detail,
                 });
             }
-            let (generation, in_flight) = {
+            let (generation, in_flight, evidence) = {
                 let inner = self.state.lock();
-                (inner.diagnostics_generation, inner.progress_tokens.len())
+                (
+                    inner.diagnostics_generation,
+                    inner.progress_tokens.len(),
+                    settle_evidence(&inner, only_uri, pull_advertised),
+                )
             };
-            if in_flight == 0 && last_generation == Some(generation) {
+            if in_flight == 0 && last_generation == Some(generation) && evidence {
                 return Ok(());
             }
             last_generation = Some(generation);
             if Instant::now() >= deadline {
+                let detail = if evidence {
+                    "diagnostics generation did not stabilize within the ready deadline".to_string()
+                } else {
+                    "no diagnostics evidence arrived after the last document sync \
+                     within the ready deadline"
+                        .to_string()
+                };
                 return Err(BridgeError::ServerNotReady {
                     server: self.entry.id.clone(),
-                    detail: "diagnostics did not settle within the ready deadline".to_string(),
+                    detail,
                 });
             }
             std::thread::sleep(Duration::from_millis(SETTLE_POLL_MS));
@@ -654,6 +770,7 @@ impl Session {
             "session_started_ms": inner.started_ms,
             "session_age_ms": self.start_instant.elapsed().as_millis(),
             "open_documents": inner.documents.len(),
+            "progress_cycles_completed": inner.progress_completed,
             "protocol_violations": inner.protocol_violations,
             "mutation": config.mutation,
         });
@@ -723,6 +840,34 @@ impl Session {
     /// Session start instant on the bridge's monotonic clock.
     pub fn bridge_started(&self) -> Instant {
         self.bridge_started
+    }
+}
+
+/// The evidence half of the settle predicate (P4 item 2), computed
+/// under the state lock. See `Session::wait_diagnostics_settled` for
+/// the reasoning per branch.
+fn settle_evidence(inner: &Inner, only_uri: Option<&str>, pull_advertised: bool) -> bool {
+    if pull_advertised {
+        return true;
+    }
+    if inner.last_sync_seq == 0 {
+        // Nothing was ever presented to the server, so no publish
+        // is owed and the evidence requirement is vacuous.
+        return true;
+    }
+    if inner.last_progress_end_seq > inner.last_sync_seq {
+        return true;
+    }
+    if inner.saw_activity && inner.last_quiescent_seq > inner.last_sync_seq {
+        return true;
+    }
+    match only_uri {
+        Some(uri) => {
+            let synced = inner.doc_sync_seq.get(uri).copied().unwrap_or(0);
+            let published = inner.doc_publish_seq.get(uri).copied().unwrap_or(0);
+            synced > 0 && published > synced
+        }
+        None => inner.last_publish_seq > inner.last_sync_seq,
     }
 }
 
@@ -1141,6 +1286,10 @@ fn handle_notification(state: &Arc<SessionState>, method: &str, params: &serde_j
             let mut inner = state.lock();
             inner.diagnostics.insert(uri.to_string(), normalized);
             inner.diagnostics_generation += 1;
+            inner.event_seq += 1;
+            let seq = inner.event_seq;
+            inner.doc_publish_seq.insert(uri.to_string(), seq);
+            inner.last_publish_seq = seq;
         }
         "$/progress" => {
             let token = params
@@ -1164,6 +1313,9 @@ fn handle_notification(state: &Arc<SessionState>, method: &str, params: &serde_j
                 }
                 "end" => {
                     inner.progress_tokens.remove(&token);
+                    inner.event_seq += 1;
+                    inner.last_progress_end_seq = inner.event_seq;
+                    inner.progress_completed += 1;
                 }
                 _ => {}
             }
@@ -1172,7 +1324,10 @@ fn handle_notification(state: &Arc<SessionState>, method: &str, params: &serde_j
             if let Some(quiescent) = params.get("quiescent").and_then(serde_json::Value::as_bool) {
                 let mut inner = state.lock();
                 inner.server_status_quiescent = Some(quiescent);
-                if !quiescent {
+                if quiescent {
+                    inner.event_seq += 1;
+                    inner.last_quiescent_seq = inner.event_seq;
+                } else {
                     inner.saw_activity = true;
                 }
             }

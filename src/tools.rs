@@ -811,9 +811,14 @@ fn tool_code_actions(
     // The protocol's context: the file's diagnostics overlapping the
     // range, in wire shape. Servers key quickfix offers off these
     // (a type error's fix exists only relative to its diagnostic),
-    // so they are part of the request, not an embellishment.
+    // so they are part of the request, not an embellishment. This is
+    // the bounded-drain context read, not the settling read (P4
+    // item 2): the server already holds its own newest diagnostics
+    // state, and parking this request behind the strict evidence
+    // predicate would stall — and at the deadline, fail — code
+    // actions on any server whose evidence arrives late or never.
     let context_diagnostics: Vec<serde_json::Value> = session
-        .diagnostics(manager.config(), Some(&uri))?
+        .diagnostics_context(Some(&uri))
         .iter()
         .filter(|diagnostic| ranges_overlap(diagnostic.range, range))
         .map(diagnostic_to_lsp)

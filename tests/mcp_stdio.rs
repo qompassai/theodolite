@@ -1053,3 +1053,202 @@ fn orphan_gate_no_survivors_after_bridge_sigkill() {
         std::thread::sleep(Duration::from_millis(50));
     }
 }
+
+// --- P4: process-tree ownership and the settle revisit -----------------
+
+fn wait_pid_file(path: &Path, label: &str) -> u32 {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        if let Ok(text) = std::fs::read_to_string(path)
+            && let Ok(pid) = text.trim().parse::<u32>()
+        {
+            return pid;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "{label} never wrote its pid file"
+        );
+        std::thread::sleep(Duration::from_millis(25));
+    }
+}
+
+fn assert_pid_gone(pid: u32, label: &str) {
+    // Poll-based: an already-dead pid is success, not a failed
+    // precondition — the tree kill may legitimately complete before
+    // the first check runs.
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while Path::new(&format!("/proc/{pid}")).exists() {
+        assert!(
+            Instant::now() < deadline,
+            "{label} (pid {pid}) survived by >5 s"
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
+fn assert_pid_running(pid: u32, label: &str) {
+    assert!(
+        Path::new(&format!("/proc/{pid}")).exists(),
+        "{label} (pid {pid}) is not running"
+    );
+}
+
+/// Spawn a bridge over a `daemon`-mode fake, start the session, and
+/// return (bridge, fake pid, daemon pid, supervisor pid).
+fn daemon_tree(tag: &str) -> (Bridge, PathBuf, u32, u32, u32) {
+    let dir = temp_dir(tag);
+    let ws = make_workspace(&dir);
+    let fake_pid_file = dir.join("fake.pid");
+    let daemon_pid_file = dir.join("daemon.pid");
+    let config = write_fake_config(
+        &dir,
+        "daemon",
+        "",
+        &[
+            ("FAKE_LSP_PID_FILE", fake_pid_file.to_str().expect("utf8")),
+            (
+                "FAKE_LSP_DAEMON_PID_FILE",
+                daemon_pid_file.to_str().expect("utf8"),
+            ),
+        ],
+    );
+    let mut bridge = Bridge::spawn(&config);
+    let (is_error, _) = bridge.call_tool("hover", hover_args(&ws));
+    assert!(!is_error);
+    let fake_pid = wait_pid_file(&fake_pid_file, "fake server");
+    let daemon_pid = wait_pid_file(&daemon_pid_file, "leaked daemon");
+    let (is_error, status) = bridge.call_tool(
+        "session_status",
+        serde_json::json!({"workspace": ws.to_string_lossy(), "server": "fake"}),
+    );
+    assert!(!is_error, "{status}");
+    let supervisor_pid = status["pid"].as_u64().expect("supervisor pid") as u32;
+    assert_ne!(supervisor_pid, fake_pid, "status pid must be the tree root");
+    // The whole tree is alive before any kill: supervisor, server,
+    // and the leaked daemon all exist right now.
+    assert_pid_running(supervisor_pid, "supervisor");
+    assert_pid_running(fake_pid, "fake server");
+    assert_pid_running(daemon_pid, "leaked daemon");
+    (bridge, ws, fake_pid, daemon_pid, supervisor_pid)
+}
+
+#[test]
+fn tree_gate_restart_kills_server_and_leaked_daemon() {
+    let (mut bridge, ws, fake_pid, daemon_pid, _supervisor) = daemon_tree("tree-restart");
+    let (is_error, result) = bridge.call_tool(
+        "session_restart",
+        serde_json::json!({"workspace": ws.to_string_lossy(), "server": "fake"}),
+    );
+    assert!(!is_error, "{result}");
+    // The old tree is gone entirely — server AND the daemon it
+    // leaked into the session's process group.
+    assert_pid_gone(fake_pid, "old fake server");
+    assert_pid_gone(daemon_pid, "old leaked daemon");
+    // And the fresh session works.
+    let (is_error, _) = bridge.call_tool("hover", hover_args(&ws));
+    assert!(!is_error);
+    bridge.shutdown();
+}
+
+#[test]
+fn tree_gate_bridge_eof_kills_the_whole_tree() {
+    let (bridge, _ws, fake_pid, daemon_pid, supervisor_pid) = daemon_tree("tree-eof");
+    bridge.shutdown();
+    assert_pid_gone(supervisor_pid, "supervisor");
+    assert_pid_gone(fake_pid, "fake server");
+    assert_pid_gone(daemon_pid, "leaked daemon");
+}
+
+#[test]
+fn tree_gate_bridge_sigkill_kills_the_whole_tree() {
+    let (mut bridge, _ws, fake_pid, daemon_pid, supervisor_pid) = daemon_tree("tree-sigkill");
+    bridge.child.kill().expect("SIGKILL the bridge");
+    let _ = bridge.child.wait();
+    // No LSP shutdown can run after SIGKILL: the supervisor's
+    // bridge-liveness poll is the guarantee, and it must reap the
+    // server and the leaked daemon, then exit itself.
+    assert_pid_gone(daemon_pid, "leaked daemon");
+    assert_pid_gone(fake_pid, "fake server");
+    assert_pid_gone(supervisor_pid, "supervisor");
+}
+
+#[test]
+fn tree_gate_bridge_sigterm_kills_the_whole_tree() {
+    let (mut bridge, _ws, fake_pid, daemon_pid, supervisor_pid) = daemon_tree("tree-sigterm");
+    let bridge_pid = bridge.child.id();
+    let status = Command::new("/bin/kill")
+        .arg("-TERM")
+        .arg("--")
+        .arg(bridge_pid.to_string())
+        .status()
+        .expect("send SIGTERM to the bridge");
+    assert!(status.success());
+    let _ = bridge.child.wait();
+    assert_pid_gone(daemon_pid, "leaked daemon");
+    assert_pid_gone(fake_pid, "fake server");
+    assert_pid_gone(supervisor_pid, "supervisor");
+}
+
+#[test]
+fn diagnostics_waits_for_the_late_first_publish() {
+    let dir = temp_dir("late-publish");
+    let ws = make_workspace(&dir);
+    let config = write_fake_config(&dir, "late-publish", "", &[]);
+    let mut bridge = Bridge::spawn(&config);
+    // No warm-up call: the diagnostics call itself syncs the file,
+    // and the fake publishes ~3 s after didOpen (the P2 Finding 3
+    // shape). The v1 predicate settled at generation 0 in ~0.5 s
+    // and returned an empty set; the evidence predicate must wait
+    // for the publish and return it.
+    let started = Instant::now();
+    let (is_error, result) = bridge.call_tool(
+        "diagnostics",
+        serde_json::json!({
+            "workspace": ws.to_string_lossy(), "server": "fake", "path": "main.rs"
+        }),
+    );
+    let elapsed = started.elapsed();
+    assert!(!is_error, "{result}");
+    assert_eq!(result["count"], 1, "{result}");
+    assert_eq!(
+        result["diagnostics"][0]["message"],
+        "late arrival diagnostic"
+    );
+    assert!(
+        elapsed >= Duration::from_millis(2_500),
+        "diagnostics returned after {elapsed:?}; it did not wait for the publish"
+    );
+    bridge.shutdown();
+}
+
+#[test]
+fn diagnostics_without_any_evidence_hits_the_ready_deadline() {
+    let dir = temp_dir("never-publish");
+    let ws = make_workspace(&dir);
+    let config = write_fake_config(&dir, "never-publish", "ready_timeout_ms = 3000", &[]);
+    let mut bridge = Bridge::spawn(&config);
+    // The fake answers requests but offers no diagnostics surface
+    // at all: no publish, no progress, no status, no pull provider.
+    // The call must fail loudly with the typed not-ready at the
+    // configured deadline — not return a confident empty set, and
+    // not hang past the deadline either.
+    let started = Instant::now();
+    let (is_error, result) = bridge.call_tool(
+        "diagnostics",
+        serde_json::json!({
+            "workspace": ws.to_string_lossy(), "server": "fake", "path": "main.rs"
+        }),
+    );
+    let elapsed = started.elapsed();
+    assert!(is_error, "{result}");
+    assert_eq!(Bridge::error_code(&result), "ServerNotReady", "{result}");
+    assert!(
+        elapsed >= Duration::from_millis(2_500),
+        "diagnostics failed after {elapsed:?}; it did not wait out the deadline"
+    );
+    assert!(
+        elapsed < Duration::from_secs(25),
+        "diagnostics hung past the ready deadline ({elapsed:?})"
+    );
+    bridge.shutdown();
+}
