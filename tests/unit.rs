@@ -167,14 +167,8 @@ fn merge_diagnostics_dedups_and_marks_provenance() {
     let diagnostic = |line: u64, message: &str, channel: DiagnosticChannel| Diagnostic {
         uri: "file:///a.rs".into(),
         range: Range {
-            start: Position {
-                line,
-                character: 0,
-            },
-            end: Position {
-                line,
-                character: 3,
-            },
+            start: Position { line, character: 0 },
+            end: Position { line, character: 3 },
         },
         severity: 1,
         source: "clippy".into(),

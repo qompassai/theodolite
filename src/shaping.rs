@@ -134,10 +134,7 @@ pub fn diagnostics_from_lsp(
 /// with the same diagnostic identity (everything but the channel)
 /// collapse to one entry with combined provenance (SPEC §4.3 sorts
 /// afterwards; identity uses the same fields the sort key uses).
-pub fn merge_diagnostics(
-    push: Vec<Diagnostic>,
-    pull: Vec<Diagnostic>,
-) -> Vec<Diagnostic> {
+pub fn merge_diagnostics(push: Vec<Diagnostic>, pull: Vec<Diagnostic>) -> Vec<Diagnostic> {
     let mut merged: Vec<Diagnostic> = Vec::with_capacity(push.len() + pull.len());
     for candidate in push.into_iter().chain(pull) {
         match merged.iter_mut().find(|existing| {

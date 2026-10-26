@@ -12,12 +12,16 @@ pinned server sessions and never touches an editor.
 Design authority: `~/workspace/lsp-mcp-study-20261025/SPEC.md`.
 Build record: `BUILD-REPORT.md` in this directory.
 
-## v1 surface (read-only)
+## Surface (read-only; v1 + P3 read-class completion)
 
-Tools: `session_status`, `diagnostics`, `hover`, `definition`,
-`references`, `document_symbols`, `session_restart`. The mutation
-class is not registered at all in v1; there is no generic
-any-LSP-method tool and no rename apply.
+Tools: `session_status`, `diagnostics` (push accumulation merged
+with pull where the server advertises it, per-diagnostic channel
+provenance), `hover`, `definition`, `declaration`,
+`type_definition`, `implementation`, `references`,
+`document_symbols`, `workspace_symbols`, `code_actions` (listing
+only — payloads never returned, never executed),
+`session_restart`. The mutation class is not registered at all;
+there is no generic any-LSP-method tool and no rename apply.
 
 Servers (config data, not code): bacon-ls (diagnostics owner),
 rust-analyzer (semantics), lua-language-server (second proof

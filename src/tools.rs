@@ -1,10 +1,13 @@
 //! MCP tool definitions and result shaping (SPEC §2 `bridge-tools`,
-//! §6). The v1 surface is read-class only, per the Owner-approved
-//! staged scope: `session_status`, `diagnostics`, `hover`,
-//! `definition`, `references`, `document_symbols`, and the session
-//! class's `session_restart`. The mutation class is not registered
-//! at all (SPEC §6 gate posture) and there is no generic
-//! any-LSP-method tool (SPEC §8).
+//! §6). The surface is read-class only, per the Owner-approved
+//! staged scope: the v1 set (`session_status`, `diagnostics`,
+//! `hover`, `definition`, `references`, `document_symbols`,
+//! `session_restart`) plus the P3 read-class completion (pull
+//! diagnostics merged into `diagnostics`; the definition family
+//! `declaration` / `type_definition` / `implementation`;
+//! `workspace_symbols`; `code_actions` as a listing only). The
+//! mutation class is not registered at all (SPEC §6 gate posture)
+//! and there is no generic any-LSP-method tool (SPEC §8).
 
 use std::sync::Arc;
 
@@ -199,7 +202,7 @@ pub fn call_tool(
         "code_actions" => tool_code_actions(manager, arguments),
         "session_restart" => tool_session_restart(manager, arguments),
         other => Err(BridgeError::UnsupportedMethod {
-            detail: format!("no tool named {other:?} is registered in v1"),
+            detail: format!("no tool named {other:?} is registered"),
         }),
     }
 }
@@ -522,11 +525,7 @@ fn definition_family_tool(
             ),
         });
     }
-    let raw = session.request(
-        member.method(),
-        params,
-        manager.config().request_timeout_ms,
-    )?;
+    let raw = session.request(member.method(), params, manager.config().request_timeout_ms)?;
     shape_location_result(&session, &raw)
 }
 
@@ -882,7 +881,10 @@ fn summarize_action(entry: &serde_json::Value) -> ActionSummary {
         .to_string();
     // A bare Command carries `command` as a string and has no kind
     // or edit of its own.
-    if entry.get("command").is_some_and(serde_json::Value::is_string) {
+    if entry
+        .get("command")
+        .is_some_and(serde_json::Value::is_string)
+    {
         return ActionSummary {
             title,
             kind: String::new(),

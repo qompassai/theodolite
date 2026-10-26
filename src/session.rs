@@ -571,11 +571,7 @@ impl Session {
     /// `unchanged` report (which a conforming server only sends
     /// against a `previousResultId` the bridge never supplied)
     /// normalizes to an empty set.
-    pub fn pull_diagnostics(
-        &self,
-        config: &Config,
-        uri: &str,
-    ) -> BridgeResult<Vec<Diagnostic>> {
+    pub fn pull_diagnostics(&self, config: &Config, uri: &str) -> BridgeResult<Vec<Diagnostic>> {
         let raw = self.request(
             "textDocument/diagnostic",
             serde_json::json!({"textDocument": {"uri": uri}}),
