@@ -1,0 +1,46 @@
+# theodolite bridge config — copy to the target machine and pin the
+# ACTUAL binary paths and version strings found there. The bridge
+# probes each binary at session start and refuses a mismatch; never
+# point `binary` at a rustup proxy (proxies need ambient env the
+# bridge deliberately scrubs — pin the toolchain's real binary).
+#
+# Timeouts are config data; the defaults below are the SPEC values.
+
+# request_timeout_ms = 60000
+# ready_timeout_ms = 30000
+# shutdown_grace_ms = 2000
+mutation = "off"
+
+[[server]]
+id = "bacon-ls"
+binary = "/home/phaedrus/.cargo/bin/bacon-ls"
+version_probe = ["--version"]
+expect_version = "RECORD-ON-TARGET-MACHINE"
+languages = ["rust"]
+extensions = ["rs"]
+language_ids = { rs = "rust" }
+readiness = "immediate"
+diagnostics_owner = true
+env = { PATH = "/home/phaedrus/.cargo/bin:/usr/local/bin:/usr/bin:/bin" }
+
+[[server]]
+id = "rust-analyzer"
+binary = "/usr/bin/rust-analyzer"
+version_probe = ["--version"]
+expect_version = "RECORD-ON-TARGET-MACHINE"
+languages = ["rust"]
+extensions = ["rs"]
+language_ids = { rs = "rust" }
+readiness = "quiescent"
+env = { PATH = "/home/phaedrus/.cargo/bin:/usr/local/bin:/usr/bin:/bin" }
+
+[[server]]
+id = "lua-language-server"
+binary = "/usr/bin/lua-language-server"
+version_probe = ["--version"]
+expect_version = "RECORD-ON-TARGET-MACHINE"
+languages = ["lua"]
+extensions = ["lua"]
+language_ids = { lua = "lua" }
+readiness = "immediate"
+env = {}
