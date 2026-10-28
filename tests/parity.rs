@@ -460,14 +460,20 @@ fn parity_gate_bridge_diagnostics_equal_standalone_bacon_ls() {
         stdout.read_line(&mut line).expect("read bridge frame");
         serde_json::from_str(&line).expect("bridge frame JSON")
     };
+    // Modern era (2026-07-28, WS2 W4): no handshake — discovery
+    // opens the session and every request carries `_meta`.
+    let meta = serde_json::json!({
+        "io.modelcontextprotocol/protocolVersion": "2026-07-28",
+        "io.modelcontextprotocol/clientCapabilities": {}
+    });
     send(serde_json::json!({
-        "jsonrpc": "2.0", "id": 1, "method": "initialize",
-        "params": {"protocolVersion": "2024-11-05"}
+        "jsonrpc": "2.0", "id": 1, "method": "server/discover",
+        "params": {"_meta": meta}
     }));
     let _ = recv(&mut stdout);
     send(serde_json::json!({
         "jsonrpc": "2.0", "id": 2, "method": "tools/call",
-        "params": {"name": "diagnostics", "arguments": {
+        "params": {"name": "diagnostics", "_meta": meta, "arguments": {
             "workspace": ws.to_string_lossy(), "server": "bacon-ls", "path": "src/lib.rs"
         }}
     }));

@@ -79,6 +79,7 @@ struct Bridge {
     stdin: ChildStdin,
     stdout: BufReader<ChildStdout>,
     next_id: i64,
+    client: Option<String>,
 }
 
 impl Bridge {
@@ -86,9 +87,27 @@ impl Bridge {
         Bridge::spawn_as(config, None)
     }
 
-    /// Spawn and complete the MCP handshake, asserting a client
-    /// identity (`clientInfo.name`) when `client` is given. The
-    /// mutation gate decides on exactly this identity (P5 item 2).
+    /// The modern-era per-request metadata (2026-07-28): protocol
+    /// version, capabilities, and — when `client` is given — the
+    /// client identity (`clientInfo.name`) the mutation gate
+    /// decides on (P5 item 2). Since the WS2 W4 migration the era
+    /// has no handshake; identity rides in `_meta` on every frame.
+    fn meta(&self) -> serde_json::Value {
+        let mut meta = serde_json::json!({
+            "io.modelcontextprotocol/protocolVersion": "2026-07-28",
+            "io.modelcontextprotocol/clientCapabilities": {}
+        });
+        if let Some(name) = &self.client {
+            meta["io.modelcontextprotocol/clientInfo"] =
+                serde_json::json!({"name": name, "version": "test"});
+        }
+        meta
+    }
+
+    /// Spawn and open the modern-era session with `server/discover`,
+    /// asserting a client identity (`clientInfo.name`) when `client`
+    /// is given. The mutation gate decides on exactly this identity
+    /// (P5 item 2).
     fn spawn_as(config: &Path, client: Option<&str>) -> Bridge {
         let mut child = Command::new(bridge_bin())
             .arg("--config")
@@ -105,13 +124,18 @@ impl Bridge {
             stdin,
             stdout,
             next_id: 0,
+            client: client.map(str::to_string),
         };
-        let mut params = serde_json::json!({"protocolVersion": "2024-11-05"});
-        if let Some(name) = client {
-            params["clientInfo"] = serde_json::json!({"name": name, "version": "test"});
-        }
-        let response = bridge.request("initialize", params);
-        assert_eq!(response["result"]["serverInfo"]["name"], "theodolite");
+        let meta = bridge.meta();
+        let response = bridge.request("server/discover", serde_json::json!({"_meta": meta}));
+        assert_eq!(
+            response["result"]["_meta"]["io.modelcontextprotocol/serverInfo"]["name"],
+            "theodolite"
+        );
+        assert_eq!(
+            response["result"]["supportedVersions"],
+            serde_json::json!(["2026-07-28"])
+        );
         bridge
     }
 
@@ -132,6 +156,12 @@ impl Bridge {
     fn request(&mut self, method: &str, params: serde_json::Value) -> serde_json::Value {
         self.next_id += 1;
         let id = self.next_id;
+        // Every modern request carries `_meta` (2026-07-28); the
+        // discover call in spawn_as passes its own, ready-made.
+        let mut params = params;
+        if params.get("_meta").is_none() {
+            params["_meta"] = self.meta();
+        }
         self.send(&serde_json::json!({
             "jsonrpc": "2.0", "id": id, "method": method, "params": params
         }));
