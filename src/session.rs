@@ -34,6 +34,20 @@ pub const VERSION_PROBE_TIMEOUT_MS: u64 = 10_000;
 /// Diagnostics settle poll interval (SPEC §6: two polls this far
 /// apart with a stable diagnostics generation means settled).
 pub const SETTLE_POLL_MS: u64 = 250;
+/// While diagnostics evidence is outstanding, the bridge
+/// re-asserts the saved state of its open documents at most this
+/// often (D-408). A `didSave` that lands before a save-driven
+/// server has finished initializing its backend is silently
+/// dropped by that server (measured against bacon-ls 0.31: a save
+/// received ~1 ms before its "backend detected" log line produced
+/// no publish, ever), so the single save at open time is a race.
+/// Re-asserting until evidence arrives — bounded by the ready
+/// deadline that already governs the settle wait — turns that
+/// race into a certainty without widening any deadline: the first
+/// re-assertion lands seconds after open, long past any measured
+/// backend initialization, and the wait still ends the moment
+/// evidence lands or the deadline expires.
+pub const DID_SAVE_RETRY_MS: u64 = 2_000;
 /// Readiness poll interval in milliseconds.
 pub const READY_POLL_MS: u64 = 100;
 /// Per-attempt timeout for the first-response readiness probe:
@@ -237,9 +251,9 @@ impl SessionState {
     }
 
     /// Stamp a document-sync event: the bridge is about to send a
-    /// didOpen/didChange/didClose for `uri` (P4 item 2). Only actual
-    /// sends are stamped; an unchanged-content re-sync sends nothing
-    /// and stamps nothing.
+    /// didOpen/didChange/didClose/didSave for `uri` (P4 item 2). Only
+    /// actual sends are stamped; an unchanged-content re-sync sends
+    /// nothing and stamps nothing.
     fn note_sync(&self, uri: &str) {
         let mut inner = self.lock();
         inner.event_seq += 1;
@@ -349,7 +363,7 @@ impl Session {
             "workspaceFolders": [{"uri": root_uri, "name": name}],
             "capabilities": {
                 "textDocument": {
-                    "synchronization": {"didSave": false},
+                    "synchronization": {"didSave": true},
                     "publishDiagnostics": {"relatedInformation": false},
                     "diagnostic": {"dynamicRegistration": false},
                     "hover": {"contentFormat": ["markdown", "plaintext"]},
@@ -693,9 +707,11 @@ impl Session {
     }
 
     /// Sync one file from disk into the session (SPEC §3.5): stat +
-    /// hash check, `didOpen` on first touch, full-text `didChange`
-    /// when the bytes changed, `didClose` when the file vanished.
-    /// Returns the document URI and its current version.
+    /// hash check, `didOpen` on first touch (followed by a
+    /// `didSave` when the server advertised save support, since the
+    /// presented bytes are on-disk — i.e. saved — state), full-text
+    /// `didChange` when the bytes changed, `didClose` when the file
+    /// vanished. Returns the document URI and its current version.
     pub fn sync_file(&self, absolute_path: &Path) -> BridgeResult<(String, i64)> {
         let uri = crate::shaping::path_to_uri(absolute_path);
         let metadata = std::fs::metadata(absolute_path);
@@ -775,6 +791,14 @@ impl Session {
                         size,
                     },
                 );
+                // Editor-faithful save (D-408): the bridge presents
+                // on-disk state, so a document it has just opened
+                // from disk is in the saved state an editor would
+                // report with `didSave`. Servers that publish only
+                // on save (current bacon-ls under its Bacon backend
+                // is the measured case) otherwise stay silent for
+                // the opened document forever.
+                self.notify_did_save(&uri, Some(&text))?;
                 Ok((uri, 1))
             }
         }
@@ -852,6 +876,79 @@ impl Session {
     /// (`textDocument/diagnostic`, advertised as `diagnosticProvider`).
     pub fn supports_pull_diagnostics(&self) -> bool {
         self.capability_advertised("diagnosticProvider")
+    }
+
+    /// The server's advertised save support, read from the captured
+    /// `textDocumentSync` capability — never probed by trial.
+    /// Returns `Some(include_text)` when the server advertises save
+    /// notifications, `None` when it does not. The advertised forms
+    /// (LSP `TextDocumentSyncOptions.save`) are: a boolean (`true`
+    /// advertises save without text), or a `SaveOptions` object
+    /// (advertises save; its `includeText` flag, defaulting to
+    /// `false`, says whether the notification must carry the
+    /// document text). A bare sync-kind number, a missing options
+    /// object, `save: false`, and a missing `save` field all
+    /// advertise no save support.
+    pub fn save_include_text(&self) -> Option<bool> {
+        let capabilities = self.state.lock().server_capabilities.clone();
+        let sync = capabilities.get("textDocumentSync")?;
+        let save = sync.get("save")?;
+        match save {
+            serde_json::Value::Bool(true) => Some(false),
+            serde_json::Value::Bool(false) | serde_json::Value::Null => None,
+            serde_json::Value::Object(_) => Some(
+                save.get("includeText")
+                    .and_then(serde_json::Value::as_bool)
+                    .unwrap_or(false),
+            ),
+            _ => None,
+        }
+    }
+
+    /// Send one `textDocument/didSave` for `uri`, but only when the
+    /// server advertised save support (see `save_include_text`) —
+    /// an unadvertised notification is never sent. `text_hint`
+    /// supplies the document text when the caller already holds it
+    /// (the `didOpen` path in `sync_file`); without a hint, a
+    /// server whose `SaveOptions` ask for the text gets it read
+    /// back from disk, which is the state the save asserts. A
+    /// server that did not ask for text never receives any.
+    fn notify_did_save(&self, uri: &str, text_hint: Option<&str>) -> BridgeResult<()> {
+        let Some(include_text) = self.save_include_text() else {
+            return Ok(());
+        };
+        self.state.note_sync(uri);
+        let mut params = serde_json::json!({"textDocument": {"uri": uri}});
+        if include_text {
+            let text = match text_hint {
+                Some(text) => Some(text.to_string()),
+                None => crate::shaping::uri_to_path(uri)
+                    .ok()
+                    .and_then(|path| std::fs::read_to_string(path).ok()),
+            };
+            if let Some(text) = text {
+                params["text"] = serde_json::Value::String(text);
+            }
+        }
+        self.notify("textDocument/didSave", params)
+    }
+
+    /// Re-assert the saved state of the open documents in scope
+    /// (all of them, or only `only_uri`) for the settle wait's
+    /// evidence-driven retry (see `DID_SAVE_RETRY_MS`). Errors are
+    /// the caller's problem on its next poll — the settle loop
+    /// re-checks the phase and the deadline every iteration, so a
+    /// failed re-assertion here loses nothing.
+    fn resave_open_documents(&self, only_uri: Option<&str>) {
+        if self.save_include_text().is_none() {
+            return;
+        }
+        for uri in self.open_document_uris() {
+            if only_uri.is_some_and(|only| uri != only) {
+                continue;
+            }
+            let _ = self.notify_did_save(&uri, None);
+        }
     }
 
     /// Mint an action handle for one listed code action's shaped
@@ -992,6 +1089,7 @@ impl Session {
         let deadline = Instant::now() + Duration::from_millis(config.ready_timeout_ms);
         let pull_advertised = self.supports_pull_diagnostics();
         let mut last_generation: Option<u64> = None;
+        let mut next_resave = Instant::now() + Duration::from_millis(DID_SAVE_RETRY_MS);
         loop {
             if let Phase::Dead(detail) = self.state.phase() {
                 return Err(BridgeError::ServerDied {
@@ -1011,6 +1109,17 @@ impl Session {
                 return Ok(());
             }
             last_generation = Some(generation);
+            if !evidence && Instant::now() >= next_resave {
+                // The save at open time may have landed before a
+                // save-driven server finished initializing and been
+                // dropped (see DID_SAVE_RETRY_MS): re-assert the
+                // saved state and keep waiting on the same
+                // deadline. Evidence is checked before this runs
+                // every iteration, so a publish provoked by an
+                // earlier save is never stamped over.
+                self.resave_open_documents(only_uri);
+                next_resave = Instant::now() + Duration::from_millis(DID_SAVE_RETRY_MS);
+            }
             if Instant::now() >= deadline {
                 let detail = if evidence {
                     "diagnostics generation did not stabilize within the ready deadline".to_string()
