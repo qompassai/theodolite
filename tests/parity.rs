@@ -40,6 +40,43 @@ pub fn broken() -> u32 {
 }
 "#;
 
+/// The bacon job and export definitions the fixture's backend run
+/// relies on. bacon-ls's background export invokes
+/// `bacon --headless -j bacon-ls` in the fixture workspace, and
+/// `bacon-ls` is not a bacon built-in job — on primo it is defined
+/// by the developer's global bacon preferences (qompassai/dotfiles),
+/// so a machine without those preferences fails this gate for
+/// reasons unrelated to the bridge: the exporter exits with
+/// "job not found", `.bacon-locations` is never written, and the
+/// warm-up wait times out. The fixture therefore carries the
+/// definitions itself — the job and the spans export verbatim from
+/// primo's prefs.toml — so the gate is hermetic: same job, same
+/// export, same locations file, on any machine.
+///
+/// One deliberate omission: primo's prefs also define an
+/// `[exports.locations]` export (the `locations` exporter chained
+/// to `cargo-json-spans`) writing the same `.bacon-locations`
+/// path. Under bacon 3.26 + bacon-ls 0.31 that second exporter
+/// races the first into the shared file and its lines are
+/// unparseable by bacon-ls ("malformed line: expected 9 parts in
+/// the format of severity|:|path|:|..."), zeroing the published
+/// diagnostics; upstream's current bacon-ls configuration defines
+/// only the analyzer export. The pair coexisted under primo's
+/// older pinned versions — this is era skew in the canonical
+/// config itself, and the fixture keeps the half the gate's
+/// server actually parses.
+const FIXTURE_BACON_TOML: &str = r#"[jobs.bacon-ls]
+command = ["cargo", "clippy", "--workspace", "--tests", "--all-targets", "--all-features", "--message-format", "json-diagnostic-rendered-ansi"]
+analyzer = "cargo_json"
+need_stdout = true
+
+[exports.cargo-json-spans]
+auto = true
+exporter = "analyzer"
+line_format = "{diagnostic.level}|:|{span.file_name}|:|{span.line_start}|:|{span.line_end}|:|{span.column_start}|:|{span.column_end}|:|{diagnostic.message}|:|{diagnostic.rendered}|:|{span.suggested_replacement}"
+path = ".bacon-locations"
+"#;
+
 /// The `initializationOptions` Diver's own bacon-ls config passes
 /// (lsp/bacon_ls.lua in the diver repo). Without them bacon-ls stays
 /// in its degraded mode: it answers initialize, publishes one empty
@@ -58,6 +95,37 @@ fn bacon_initialization_options() -> serde_json::Value {
         "updateOnSaveWaitMillis": 1000,
         "useBaconBackend": true,
         "validateBaconPreferences": true
+    })
+}
+
+/// The client settings both sides answer `workspace/configuration`
+/// pulls with. bacon-ls 0.27+ dropped the flat `useBaconBackend`
+/// initialization option: the backend is chosen once at initialize
+/// from the pulled `bacon_ls` settings — an explicit
+/// `"backend": "bacon"` selects the bacon backend, while no
+/// settings at all selects the cargo backend, which never runs a
+/// background `bacon`, never writes `.bacon-locations`, and leaves
+/// this gate's warm-up with nothing to wait for. (The flat
+/// initialization options above still select the backend on
+/// bacon-ls ≤ 0.26, primo's pin among them, so both are sent.)
+/// The values mirror `bacon_initialization_options` in the current
+/// schema, and the bridge answers the same pull from its declared
+/// `settings` — both sides must drive the same server mode or the
+/// comparison is meaningless.
+fn bacon_client_settings() -> serde_json::Value {
+    serde_json::json!({
+        "backend": "bacon",
+        "bacon": {
+            "locationsFile": ".bacon-locations",
+            "runInBackground": true,
+            "runInBackgroundCommand": "bacon",
+            "runInBackgroundCommandArguments": "--headless -j bacon-ls",
+            "createPreferencesFile": true,
+            "validatePreferences": true,
+            "synchronizeAllOpenFilesWaitMillis": 2000,
+            "updateOnSave": true,
+            "updateOnSaveWaitMillis": 1000
+        }
     })
 }
 
@@ -100,6 +168,7 @@ fn make_fixture(dir: &Path) -> PathBuf {
         "[package]\nname = \"theodolite-parity-fixture\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
     )
     .expect("write Cargo.toml");
+    std::fs::write(ws.join("bacon.toml"), FIXTURE_BACON_TOML).expect("write bacon.toml");
     std::fs::write(ws.join("src/lib.rs"), FIXTURE_LIB).expect("write lib.rs");
     ws.canonicalize().expect("canonical fixture")
 }
@@ -179,10 +248,28 @@ impl DirectClient {
                         self.absorb(&params);
                     }
                 }
-                Ok(Some(LspMessage::Request { id, .. })) => {
-                    self.send(&serde_json::json!({
-                        "jsonrpc": "2.0", "id": id, "result": null
-                    }));
+                Ok(Some(LspMessage::Request { id, method, params })) => {
+                    if method == "workspace/configuration" {
+                        // Mirror the bridge's own answer (session.rs):
+                        // one copy of the declared settings per
+                        // requested item. A null answer here is a
+                        // parse error server-side and drops bacon-ls
+                        // to its default cargo backend.
+                        let count = params
+                            .get("items")
+                            .and_then(serde_json::Value::as_array)
+                            .map_or(1, Vec::len);
+                        let settings = bacon_client_settings();
+                        let results: Vec<serde_json::Value> =
+                            (0..count).map(|_| settings.clone()).collect();
+                        self.send(&serde_json::json!({
+                            "jsonrpc": "2.0", "id": id, "result": results
+                        }));
+                    } else {
+                        self.send(&serde_json::json!({
+                            "jsonrpc": "2.0", "id": id, "result": null
+                        }));
+                    }
                 }
                 Ok(None) => return None,
                 Err(_) => return None,
@@ -254,7 +341,7 @@ fn standalone_diagnostics(binary: &Path, workspace: &Path) -> Vec<Diagnostic> {
             "workspaceFolders": [{"uri": root_uri, "name": name}],
             "capabilities": {
                 "textDocument": {
-                    "synchronization": {"didSave": false},
+                    "synchronization": {"didSave": true},
                     "publishDiagnostics": {"relatedInformation": false},
                     "hover": {"contentFormat": ["markdown", "plaintext"]},
                     "definition": {},
@@ -282,6 +369,26 @@ fn standalone_diagnostics(binary: &Path, workspace: &Path) -> Vec<Diagnostic> {
             "languageId": "rust", "version": 1, "text": text
         }}
     }));
+    // Current bacon-ls (>= 0.27) no longer publishes on open under
+    // the Bacon backend: it re-publishes on save (updateOnSave) and
+    // stays silent otherwise — measured against 0.31.0, a warmed
+    // workspace produced zero publishDiagnostics in 75 s until a
+    // didSave arrived, which was answered within ~1 s with the real
+    // set. An editor writes the buffer it opened; this client does
+    // the same, with text identical to what is on disk, so both
+    // measured sides observe the same fixture state. (Under the
+    // older bacon-ls on primo the save is harmless: publishing on
+    // open already happened, and a re-publish of the same set does
+    // not change what the settle window converges to.)
+    //
+    // The save is sent from inside the settle loop below, not
+    // here: a didSave that lands before the server has finished
+    // initializing its backend is dropped — measured against
+    // 0.31.0, a save sent in the same instant as didOpen (before
+    // "bacon backend initialized") produced no publish in 120 s,
+    // while saves at +1 s and +18 s published ~1 s later. Backend
+    // initialization measured tens of ms to ~1 s across probes;
+    // the loop sends the save once, at +2 s.
     // Settle: bacon-ls publishes an empty set immediately, then the
     // real set only after its background backend has run (Diver's
     // init options carry a 2 s synchronize wait plus job time), so
@@ -292,8 +399,18 @@ fn standalone_diagnostics(binary: &Path, workspace: &Path) -> Vec<Diagnostic> {
     let deadline = opened_at + Duration::from_secs(120);
     let mut last_generation = client.generation;
     let mut last_change = Instant::now();
+    let mut saved = false;
     loop {
         let _ = client.pump_until(None, Instant::now() + Duration::from_millis(500));
+        if !saved && opened_at.elapsed() >= Duration::from_secs(2) {
+            saved = true;
+            client.send(&serde_json::json!({
+                "jsonrpc": "2.0", "method": "textDocument/didSave",
+                "params": {"textDocument": {
+                    "uri": theodolite::shaping::path_to_uri(&file)
+                }}
+            }));
+        }
         if client.generation != last_generation {
             last_generation = client.generation;
             last_change = Instant::now();
@@ -436,7 +553,13 @@ fn parity_gate_bridge_diagnostics_equal_standalone_bacon_ls() {
              runBaconInBackgroundCommandArguments = \"--headless -j bacon-ls\", \
              synchronizeAllOpenFilesWaitMillis = 2000, updateOnChange = true, \
              updateOnSave = true, updateOnSaveWaitMillis = 1000, \
-             useBaconBackend = true, validateBaconPreferences = true }}\n",
+             useBaconBackend = true, validateBaconPreferences = true }}\n\
+             settings = {{ backend = \"bacon\", bacon = {{ \
+             locationsFile = \".bacon-locations\", runInBackground = true, \
+             runInBackgroundCommandArguments = \"--headless -j bacon-ls\", \
+             createPreferencesFile = true, validatePreferences = true, \
+             synchronizeAllOpenFilesWaitMillis = 2000, updateOnSave = true, \
+             updateOnSaveWaitMillis = 1000 }} }}\n",
             binary.display()
         ),
     )
