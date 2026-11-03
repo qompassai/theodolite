@@ -2,8 +2,8 @@
   "$schema": "https://static.modelcontextprotocol.io/schemas/2025-12-11/server.schema.json",
   "name": "ai.qompass/theodolite",
   "title": "Theodolite",
-  "description": "Headless, deterministic LSP bridge: pinned language-server sessions as bounded MCP tools.",
-  "version": "0.1.0",
+  "description": "Headless, deterministic LSP bridge MCP server: pinned language-server sessions exposed as bounded read tools for editor-free contexts.",
+  "version": "0.2.1",
   "websiteUrl": "https://qompass.ai/solutions/theodolite/",
   "repository": {
     "url": "https://github.com/qompassai/theodolite",
@@ -12,8 +12,8 @@
   "packages": [
     {
       "registryType": "mcpb",
-      "identifier": "https://github.com/qompassai/theodolite/releases/download/v0.1.0/theodolite-mcp-0.1.0-linux-x64.mcpb",
-      "fileSha256": "93448a7ad8e4d2cb7b32ba766afeb1e5fb7718e5c61908f164e6afc7b3453c0f",
+      "identifier": "https://github.com/qompassai/theodolite/releases/download/v0.2.1/theodolite-mcp-0.2.1-linux-x64.mcpb",
+      "fileSha256": "a7e486a315db6a4d414305f7d51f2f4741ee0ce5232d6b1c100c4f05bdf428cd",
       "transport": {
         "type": "stdio"
       }
