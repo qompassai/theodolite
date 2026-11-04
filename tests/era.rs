@@ -160,8 +160,8 @@ fn legacy_contact_is_refused_and_the_server_survives() {
         &[
             initialize(1, "2025-06-18"),
             initialize(2, "2024-11-05"),
-            initialize(3, "2026-07-28"),
             no_meta,
+            initialize(3, "2026-07-28"),
             legacy_meta,
             discover(0),
             list,
@@ -169,14 +169,9 @@ fn legacy_contact_is_refused_and_the_server_survives() {
         ],
         8,
     );
-    // Legacy initialize at any version: the designed -32022, with
-    // the requested version named and 2026-07-28 the one support.
-    for (id, requested) in [
-        (1, "2025-06-18"),
-        (2, "2024-11-05"),
-        (3, "2026-07-28"),
-        (7, "2025-06-18"),
-    ] {
+    // Legacy initialize: the designed -32022, with the requested
+    // version named and 2026-07-28 the one support.
+    for (id, requested) in [(1, "2025-06-18"), (2, "2024-11-05"), (7, "2025-06-18")] {
         let frame = by_id(&frames, id);
         assert_eq!(frame["error"]["code"], -32022, "{frame}");
         assert_eq!(frame["error"]["data"]["requested"], requested);
@@ -185,7 +180,14 @@ fn legacy_contact_is_refused_and_the_server_survives() {
             serde_json::json!(["2026-07-28"])
         );
     }
-    // A first request without _meta meets the SDK's metadata gate.
+    // The modern version in the legacy shape (id 3): answered, not
+    // refused — the result names the era discover advertises.
+    let modern = by_id(&frames, 3);
+    assert_eq!(modern["result"]["protocolVersion"], "2026-07-28");
+    assert_eq!(modern["result"]["serverInfo"]["name"], "theodolite");
+    // A request without _meta and without a handshake (id 4 was
+    // sent before the id-3 handshake) meets the SDK's metadata
+    // gate.
     assert_eq!(by_id(&frames, 4)["error"]["code"], -32602);
     // A legacy-version _meta meets the version refusal.
     assert_eq!(by_id(&frames, 5)["error"]["code"], -32022);
@@ -307,6 +309,38 @@ fn mutation_registration_follows_meta_identity() {
             .as_array()
             .map(Vec::len),
         Some(13)
+    );
+    bridge.shutdown();
+}
+
+/// The regression of record for the capacity-study defect
+/// (2026-11-03): a stock client — `initialize` at the modern
+/// version, then plain requests with no `_meta` anywhere — opens a
+/// working session. Before the fix, the initialize met a -32022
+/// whose own `supported` list named the requested version.
+#[test]
+fn stock_modern_initialize_opens_a_working_session() {
+    let dir = temp_dir("stock");
+    let config = write_config(&dir, "mutation = \"off\"");
+    let mut bridge = RawBridge::spawn(&config);
+    let init = initialize(1, "2026-07-28");
+    let list = r#"{"jsonrpc":"2.0","id":2,"method":"tools/list","params":{}}"#.to_string();
+    let discover = r#"{"jsonrpc":"2.0","id":3,"method":"server/discover","params":{}}"#.to_string();
+    let frames = bridge.exchange(&[init, list, discover], 3);
+    let init_frame = by_id(&frames, 1);
+    assert_eq!(init_frame["result"]["protocolVersion"], "2026-07-28");
+    assert_eq!(init_frame["result"]["serverInfo"]["name"], "theodolite");
+    // No `_meta` after the handshake: the guard stamps the
+    // negotiated meta, so the list answers with the full surface.
+    let list_frame = by_id(&frames, 2);
+    assert_eq!(
+        list_frame["result"]["tools"].as_array().map(Vec::len),
+        Some(13)
+    );
+    let discover_frame = by_id(&frames, 3);
+    assert_eq!(
+        discover_frame["result"]["supportedVersions"],
+        serde_json::json!(["2026-07-28"])
     );
     bridge.shutdown();
 }

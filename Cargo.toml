@@ -1,6 +1,6 @@
 [package]
 name = "theodolite"
-version = "0.2.1"
+version = "0.2.2"
 edition = "2024"
 description = "Headless, deterministic LSP bridge MCP server: pinned language-server sessions exposed as bounded read tools for editor-free contexts."
 license = "Apache-2.0"

@@ -18,9 +18,15 @@
 //! - non-object request → `-32600` (the fleet framing contract —
 //!   the baseline dropped those silently; itemized in the gate
 //!   report)
-//! - `initialize` (any version) → the designed modern-only refusal,
-//!   `-32022` naming the supported versions; the connection and the
-//!   process stay up, so a probe can continue with modern frames
+//! - `initialize` at the modern version → answered here with the
+//!   success result (the SDK has no `initialize` handling in this
+//!   era); the handshake's client identity and capabilities are
+//!   recorded and stamped as `_meta` onto the connection's later
+//!   meta-less forwarded frames, so a legacy-shape client session
+//!   works whole. `initialize` at any other version → the designed
+//!   modern-only refusal, `-32022` naming the requested and
+//!   supported versions; the connection and the process stay up,
+//!   so a probe can continue with modern frames
 //! - unknown methods → `-32601` with the baseline's exact message
 //!   (`method not supported by theodolite: {method}`); only
 //!   `server/discover`, `ping`, `tools/list`, and `tools/call`
@@ -133,6 +139,84 @@ fn unsupported_version_frame(id: Value, requested: Value) -> Value {
     })
 }
 
+/// The version an `initialize` asks for: `params.protocolVersion`
+/// in the legacy shape; a frame that carries the version only in
+/// its `_meta` is read from there. Anything else is `Null` (the
+/// refusal then names `null` as the requested version — what the
+/// client actually sent).
+fn requested_version(params: Option<&Value>) -> Value {
+    let Some(params) = params.filter(|p| p.is_object()) else {
+        return Value::Null;
+    };
+    if let Some(version) = params.get("protocolVersion") {
+        return version.clone();
+    }
+    if let Some(version) = params
+        .get("_meta")
+        .and_then(|meta| meta.get("io.modelcontextprotocol/protocolVersion"))
+    {
+        return version.clone();
+    }
+    Value::Null
+}
+
+/// The success answer to a modern-version `initialize`: the same
+/// identity the handler reports (era, name, crate version) and the
+/// same capabilities shape `server/discover` advertises (tools
+/// only). Kept beside the refusal so the two answers can never
+/// disagree about the era: both are built from [`MODERN_VERSION`].
+fn initialize_result_frame(id: Value) -> Value {
+    json!({
+        "jsonrpc": "2.0",
+        "id": id,
+        "result": {
+            "protocolVersion": MODERN_VERSION,
+            "capabilities": {"tools": {}},
+            "serverInfo": {"name": "theodolite", "version": env!("CARGO_PKG_VERSION")}
+        }
+    })
+}
+
+/// The `_meta` template of a handshaken session: the negotiated
+/// era plus the handshake's client identity and capabilities, in
+/// the modern per-request keys. Stamped onto the connection's
+/// later meta-less forwarded frames (see [`stamp_meta`]).
+fn handshake_meta(params: Option<&Value>) -> Value {
+    let mut meta = json!({"io.modelcontextprotocol/protocolVersion": MODERN_VERSION});
+    let params = params.filter(|p| p.is_object());
+    if let Some(info) = params
+        .and_then(|p| p.get("clientInfo"))
+        .filter(|info| info.is_object())
+    {
+        meta["io.modelcontextprotocol/clientInfo"] = info.clone();
+    }
+    let capabilities = params
+        .and_then(|p| p.get("capabilities"))
+        .filter(|caps| caps.is_object())
+        .cloned()
+        .unwrap_or_else(|| json!({}));
+    meta["io.modelcontextprotocol/clientCapabilities"] = capabilities;
+    meta
+}
+
+/// Stamp the handshaken session's `_meta` onto a forwarded frame
+/// that carries none. Legacy-shape clients never send `_meta`;
+/// without the stamp their post-handshake requests meet the SDK's
+/// metadata gate (`-32602`) and the handler never sees the client
+/// identity the mutation gate decides on. A frame carrying its
+/// own `_meta` passes untouched — modern-native clients are
+/// unaffected, handshake or not.
+fn stamp_meta(mut value: Value, handshake: &Option<Value>) -> Value {
+    let Some(meta) = handshake else {
+        return value;
+    };
+    let params = params_map(&mut value);
+    if params.get("_meta").is_none() {
+        params.insert("_meta".to_string(), meta.clone());
+    }
+    value
+}
+
 /// What the guard does with one inbound line.
 #[derive(Debug, PartialEq)]
 enum Action {
@@ -145,7 +229,7 @@ enum Action {
 }
 
 /// Classify one line. Pure: unit-tested without any transport.
-fn classify(line: &[u8]) -> Action {
+fn classify(line: &[u8], handshake: &mut Option<Value>) -> Action {
     let text = String::from_utf8_lossy(line);
     let trimmed = text.trim();
     if trimmed.is_empty() {
@@ -177,15 +261,21 @@ fn classify(line: &[u8]) -> Action {
     let method = object.get("method").and_then(Value::as_str).unwrap_or("");
     match method {
         "initialize" => {
-            let requested = object
-                .get("params")
-                .and_then(|p| p.get("protocolVersion"))
-                .and_then(Value::as_str)
-                .map_or(Value::Null, |v| Value::String(v.to_string()));
-            Action::Respond(unsupported_version_frame(id, requested))
+            let requested = requested_version(object.get("params"));
+            if requested.as_str() == Some(MODERN_VERSION) {
+                // The modern era gives the SDK no `initialize`
+                // handling; the guard answers it here and records
+                // the session's meta template for later frames.
+                *handshake = Some(handshake_meta(object.get("params")));
+                Action::Respond(initialize_result_frame(id))
+            } else {
+                Action::Respond(unsupported_version_frame(id, requested))
+            }
         }
-        "server/discover" | "ping" | "tools/list" => Action::Forward(normalize_params(value)),
-        "tools/call" => Action::Forward(normalize_call(value)),
+        "server/discover" | "ping" | "tools/list" => {
+            Action::Forward(stamp_meta(normalize_params(value), handshake))
+        }
+        "tools/call" => Action::Forward(stamp_meta(normalize_call(value), handshake)),
         other => Action::Respond(error_frame(
             id,
             METHOD_NOT_FOUND,
@@ -335,6 +425,7 @@ async fn forward_loop(
     ordering: &Ordering,
 ) -> std::io::Result<()> {
     let mut reader = BufReader::new(stdin);
+    let mut handshake: Option<Value> = None;
     loop {
         match next_line(&mut reader).await? {
             LineOutcome::Eof => return Ok(()),
@@ -350,7 +441,7 @@ async fn forward_loop(
                 )
                 .await;
             }
-            LineOutcome::Line(bytes) => match classify(&bytes) {
+            LineOutcome::Line(bytes) => match classify(&bytes, &mut handshake) {
                 Action::Drop => {}
                 Action::Respond(frame) => {
                     ordering.wait_drained().await;
@@ -401,7 +492,7 @@ mod tests {
     use super::*;
 
     fn classify_str(s: &str) -> Action {
-        classify(s.as_bytes())
+        classify(s.as_bytes(), &mut None)
     }
 
     #[test]
@@ -455,6 +546,86 @@ mod tests {
                 assert_eq!(f["error"]["data"]["supported"], json!(["2026-07-28"]));
             }
             other => panic!("expected respond, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn modern_initialize_is_answered_and_stamps_the_session() {
+        let mut handshake = None;
+        let init = "{\"id\":1,\"jsonrpc\":\"2.0\",\"method\":\"initialize\",\"params\":{\"protocolVersion\":\"2026-07-28\",\"capabilities\":{\"roots\":{}},\"clientInfo\":{\"name\":\"stock-probe\",\"version\":\"1\"}}}";
+        match classify(init.as_bytes(), &mut handshake) {
+            Action::Respond(f) => {
+                assert_eq!(f["result"]["protocolVersion"], "2026-07-28");
+                assert_eq!(f["result"]["capabilities"], json!({"tools": {}}));
+                assert_eq!(f["result"]["serverInfo"]["name"], "theodolite");
+                assert_eq!(
+                    f["result"]["serverInfo"]["version"],
+                    env!("CARGO_PKG_VERSION")
+                );
+            }
+            other => panic!("expected respond, got {other:?}"),
+        }
+        assert!(handshake.is_some());
+        // A later meta-less tools/list forwards WITH the negotiated
+        // meta: the era, the handshake's identity, its capabilities.
+        match classify(
+            "{\"id\":2,\"jsonrpc\":\"2.0\",\"method\":\"tools/list\",\"params\":{}}".as_bytes(),
+            &mut handshake,
+        ) {
+            Action::Forward(f) => {
+                let meta = &f["params"]["_meta"];
+                assert_eq!(
+                    meta["io.modelcontextprotocol/protocolVersion"],
+                    "2026-07-28"
+                );
+                assert_eq!(
+                    meta["io.modelcontextprotocol/clientInfo"]["name"],
+                    "stock-probe"
+                );
+                assert_eq!(
+                    meta["io.modelcontextprotocol/clientCapabilities"],
+                    json!({"roots": {}})
+                );
+            }
+            other => panic!("expected forward, got {other:?}"),
+        }
+        // A frame carrying its own `_meta` passes untouched.
+        match classify(
+            "{\"id\":3,\"jsonrpc\":\"2.0\",\"method\":\"tools/list\",\"params\":{\"_meta\":{\"io.modelcontextprotocol/protocolVersion\":\"2026-07-28\"}}}".as_bytes(),
+            &mut handshake,
+        ) {
+            Action::Forward(f) => {
+                assert_eq!(
+                    f["params"]["_meta"],
+                    json!({"io.modelcontextprotocol/protocolVersion": "2026-07-28"})
+                );
+            }
+            other => panic!("expected forward, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn legacy_initialize_records_no_handshake() {
+        let mut handshake = None;
+        let init = "{\"id\":1,\"jsonrpc\":\"2.0\",\"method\":\"initialize\",\"params\":{\"protocolVersion\":\"2025-03-26\"}}";
+        match classify(init.as_bytes(), &mut handshake) {
+            Action::Respond(f) => {
+                assert_eq!(f["error"]["code"], UNSUPPORTED_PROTOCOL_VERSION);
+                assert_eq!(f["error"]["data"]["requested"], "2025-03-26");
+                assert_eq!(f["error"]["data"]["supported"], json!(["2026-07-28"]));
+            }
+            other => panic!("expected respond, got {other:?}"),
+        }
+        assert!(handshake.is_none());
+        // A meta-less list forwards unstamped; the SDK's metadata
+        // gate answers it, exactly as designed for non-handshaken
+        // contact.
+        match classify(
+            "{\"id\":2,\"jsonrpc\":\"2.0\",\"method\":\"tools/list\",\"params\":{}}".as_bytes(),
+            &mut handshake,
+        ) {
+            Action::Forward(f) => assert!(f["params"].get("_meta").is_none()),
+            other => panic!("expected forward, got {other:?}"),
         }
     }
 

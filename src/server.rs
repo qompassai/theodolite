@@ -11,12 +11,15 @@
 //! [`crate::guard`]) owns the stdio front door, and this type owns
 //! the surface.
 //!
-//! Modern-only posture lives in two places: the era guard refuses
-//! `initialize` before the SDK sees it, and
+//! Modern-only posture lives in two places: the era guard answers
+//! `initialize` at the front door (a modern-version handshake is
+//! answered there and its meta stamped onto the session's later
+//! frames; any other version meets the typed refusal), and
 //! [`ServerHandler::supported_protocol_versions`] pins this handler
 //! to 2026-07-28, so `server/discover` advertises exactly one
 //! version and the SDK validates every request's `_meta` against
-//! it.
+//! it. The two era spellings are tied by a unit test
+//! (`handler_era_matches_guard_era`), so the lists cannot drift.
 //!
 //! Client identity — the mutation gate's input — moves with the
 //! era: the legacy handshake carried it in `initialize`'s
@@ -214,6 +217,18 @@ impl ServerHandler for TheodoliteServer {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn handler_era_matches_guard_era() {
+        // One era list, two spellings: the guard enforces
+        // `crate::guard::MODERN_VERSION` at the front door; this
+        // handler's SDK pin must be the same version, or the two
+        // halves of the server would disagree about the era.
+        assert_eq!(
+            ProtocolVersion::V_2026_07_28.as_str(),
+            crate::guard::MODERN_VERSION
+        );
+    }
 
     #[test]
     fn canonical_text_sorts_keys_recursively() {

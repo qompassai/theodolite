@@ -9,11 +9,13 @@
 //! decision D-113) the MCP framing runs on rmcp, the official Rust
 //! MCP SDK, and speaks the modern protocol era only (2026-07-28):
 //! sessions open with `server/discover` and every request carries
-//! its protocol version in `_meta` — there is no `initialize`
-//! handshake. Legacy contact is refused at the stdio front door
-//! (see `theodolite::guard`) with the typed `-32022`
-//! unsupported-version error. The bridge's sessions, tools, and
-//! on-disk behavior are unchanged.
+//! its protocol version in `_meta`. A stock `initialize` at the
+//! modern version is answered at the stdio front door (see
+//! `theodolite::guard`) — the guard synthesizes the result and
+//! stamps the negotiated `_meta` onto the session's later frames;
+//! an `initialize` at any other version is refused there with the
+//! typed `-32022` unsupported-version error. The bridge's
+//! sessions, tools, and on-disk behavior are unchanged.
 
 #![forbid(unsafe_code)]
 
