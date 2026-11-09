@@ -36,7 +36,17 @@
 //! first-response probe must fall back to hover), `errprobe`
 //! (advertises documentSymbol but answers it with an error
 //! forever — an answered-with-error server is not a ready
-//! server). The `rich` mode also serves rename:
+//! server), `prequiescent` (advertises documentSymbol + hover,
+//! answers documentSymbol with an empty set and hover with a
+//! fixed body, and never sends any quiescence evidence — the
+//! Love Dolls pre-load shape, for the Slice 0 marker gates),
+//! `latequiescent` (opens a `$/progress` window at initialize,
+//! answers the first documentSymbol with an empty set, then —
+//! before answering the second — closes the window and reports
+//! `experimental/serverStatus` quiescent, after which the
+//! standard symbol set is served — the load-completes shape,
+//! for the marker's clearing gate). The `rich` mode also
+//! serves rename:
 //! `prepareRename` (null at line 99 — not renameable) and `rename`
 //! with scripted edit sets keyed by the requested new name
 //! (`docchanges` = the documentChanges wire shape, `fileops` = a
@@ -81,6 +91,7 @@ struct Fake {
     root_uri: String,
     opened_uri: Option<String>,
     diagnostics_sent: bool,
+    symbol_requests: u32,
 }
 
 fn serve(mode: &str) {
@@ -93,6 +104,7 @@ fn serve(mode: &str) {
         root_uri: String::new(),
         opened_uri: None,
         diagnostics_sent: false,
+        symbol_requests: 0,
     };
     loop {
         let message = match read_message(&mut reader, "fake-lsp") {
@@ -172,6 +184,60 @@ impl Fake {
             );
             return true;
         }
+        if self.mode == "prequiescent" && method == "textDocument/documentSymbol" {
+            // The Love Dolls shape: the server answers, but its
+            // workspace has not loaded, so the outline is empty —
+            // and no quiescence evidence ever arrives to say so.
+            respond(writer, id, serde_json::json!([]));
+            return true;
+        }
+        if self.mode == "prequiescent" && method == "textDocument/hover" {
+            respond(
+                writer,
+                id,
+                serde_json::json!({"contents": "prequiescent hover", "range": null}),
+            );
+            return true;
+        }
+        if self.mode == "latequiescent" && method == "textDocument/documentSymbol" {
+            self.symbol_requests += 1;
+            if self.symbol_requests == 1 {
+                // Still loading: an empty outline, no quiescence
+                // evidence yet.
+                respond(writer, id, serde_json::json!([]));
+                return true;
+            }
+            if self.symbol_requests == 2 {
+                // The load completes BEFORE this answer is written:
+                // the progress window closes and the server reports
+                // quiescent, in wire order ahead of the response,
+                // so the bridge's reader has recorded both by the
+                // time the request resolves.
+                let _ = write_message(
+                    writer,
+                    "fake-lsp",
+                    &serde_json::json!({
+                        "jsonrpc": "2.0",
+                        "method": "$/progress",
+                        "params": {
+                            "token": "latequiescent-load",
+                            "value": {"kind": "end"}
+                        }
+                    }),
+                );
+                let _ = write_message(
+                    writer,
+                    "fake-lsp",
+                    &serde_json::json!({
+                        "jsonrpc": "2.0",
+                        "method": "experimental/serverStatus",
+                        "params": {"quiescent": true}
+                    }),
+                );
+            }
+            // Requests from the second on fall through to the
+            // standard symbol answer below.
+        }
         match method {
             "initialize" => {
                 self.root_uri = params
@@ -196,6 +262,10 @@ impl Fake {
                     }),
                     "churn" | "errprobe" => serde_json::json!({
                         "documentSymbolProvider": true
+                    }),
+                    "prequiescent" | "latequiescent" => serde_json::json!({
+                        "documentSymbolProvider": true,
+                        "hoverProvider": true
                     }),
                     "hoveronly" => serde_json::json!({
                         "hoverProvider": true
@@ -225,6 +295,25 @@ impl Fake {
                                 "params": {
                                     "token": "churn-forever",
                                     "value": {"kind": "begin", "title": "indexing"}
+                                }
+                            }),
+                        );
+                    }
+                    "latequiescent" => {
+                        // A progress window that opens at load and
+                        // closes when the second documentSymbol
+                        // arrives (handled in the request intercept
+                        // above): load activity exists, but no
+                        // quiescence evidence until it completes.
+                        let _ = write_message(
+                            writer,
+                            "fake-lsp",
+                            &serde_json::json!({
+                                "jsonrpc": "2.0",
+                                "method": "$/progress",
+                                "params": {
+                                    "token": "latequiescent-load",
+                                    "value": {"kind": "begin", "title": "loading workspace"}
                                 }
                             }),
                         );

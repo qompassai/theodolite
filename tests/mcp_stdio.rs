@@ -317,6 +317,65 @@ fn document_symbols_flattened_sorted_with_containers() {
 }
 
 #[test]
+fn document_symbols_pre_quiescence_marked_never_bare() {
+    // Slice 0 adversarial (the Love Dolls shape): the server
+    // answers before its workspace has loaded and never reports
+    // quiescence. The empty outline must carry the marker, and
+    // hover is marked too — an unmarked empty would be a failed
+    // gate, not a pass.
+    let dir = temp_dir("prequiescent");
+    let ws = make_workspace(&dir);
+    let config = write_fake_config(&dir, "prequiescent", "", &[]);
+    let mut bridge = Bridge::spawn(&config);
+    let (is_error, result) = bridge.call_tool(
+        "document_symbols",
+        serde_json::json!({
+            "workspace": ws.to_string_lossy(), "server": "fake", "path": "main.rs"
+        }),
+    );
+    assert!(!is_error, "{result}");
+    assert_eq!(result["count"], 0, "{result}");
+    assert_eq!(
+        result["possibly_incomplete"], "server_not_quiescent",
+        "{result}"
+    );
+    let (is_error, hover) = bridge.call_tool("hover", hover_args(&ws));
+    assert!(!is_error, "{hover}");
+    assert_eq!(
+        hover["possibly_incomplete"], "server_not_quiescent",
+        "{hover}"
+    );
+    bridge.shutdown();
+}
+
+#[test]
+fn document_symbols_marker_clears_when_quiescence_lands() {
+    // Slice 0 validation: the same empty answer is marked while
+    // the load is in flight; once the server completes the load
+    // (progress end + quiescent report, in wire order ahead of
+    // the answer), the true symbols arrive unmarked.
+    let dir = temp_dir("latequiescent");
+    let ws = make_workspace(&dir);
+    let config = write_fake_config(&dir, "latequiescent", "", &[]);
+    let mut bridge = Bridge::spawn(&config);
+    let args = serde_json::json!({
+        "workspace": ws.to_string_lossy(), "server": "fake", "path": "main.rs"
+    });
+    let (is_error, first) = bridge.call_tool("document_symbols", args.clone());
+    assert!(!is_error, "{first}");
+    assert_eq!(first["count"], 0, "{first}");
+    assert_eq!(
+        first["possibly_incomplete"], "server_not_quiescent",
+        "{first}"
+    );
+    let (is_error, second) = bridge.call_tool("document_symbols", args);
+    assert!(!is_error, "{second}");
+    assert_eq!(second["count"], 3, "{second}");
+    assert!(second.get("possibly_incomplete").is_none(), "{second}");
+    bridge.shutdown();
+}
+
+#[test]
 fn diagnostics_waits_for_second_wave_and_sorts() {
     let dir = temp_dir("diagnostics");
     let ws = make_workspace(&dir);
@@ -1056,6 +1115,9 @@ fn workspace_symbols_over_budget_reports_true_count() {
     assert!(result.get("symbols").is_none(), "partial payload leaked");
     bridge.shutdown();
 }
+
+
+
 
 #[test]
 fn code_actions_payloads_never_reach_the_result() {

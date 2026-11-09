@@ -5,6 +5,17 @@
 # bridge deliberately scrubs — pin the toolchain's real binary).
 #
 # Timeouts are config data; the defaults below are the SPEC values.
+#
+# Slice 0 rule (coverage SPEC §3): a workspace-loading server
+# (the rust-analyzer class) pairs readiness = "quiescent" with a
+# ready_timeout_ms sized for a COLD workspace load — the estate's
+# canonical config uses 300000, because the 30000 default proved
+# too small for a cold index and pushed sessions into the
+# immediate-readiness shape that served pre-load empties. Servers
+# that stay on "immediate" are covered by the bridge's marker
+# instead: a read-class result served before the server has ever
+# reported quiescence carries
+# possibly_incomplete = "server_not_quiescent".
 
 # request_timeout_ms = 60000
 # ready_timeout_ms = 30000

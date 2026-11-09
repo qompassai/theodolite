@@ -593,6 +593,20 @@ impl Session {
             && (inner.saw_activity || inner.server_status_quiescent == Some(true))
     }
 
+    /// Whether the server has ever reported quiescence evidence in
+    /// this session: a completed `$/progress` cycle, or a
+    /// `serverStatus` quiescent=true report (the notification
+    /// handler stamps `last_quiescent_seq` only on the true edge).
+    /// Slice 0 (SPEC §3): under `immediate` readiness a tool result
+    /// served while this is false may predate workspace load, so
+    /// the tools layer marks it `possibly_incomplete` — an empty
+    /// answer must never again be indistinguishable from a true
+    /// empty (the Love Dolls shape).
+    pub fn quiescence_ever_reported(&self) -> bool {
+        let inner = self.state.lock();
+        inner.last_quiescent_seq > 0 || inner.last_progress_end_seq > 0
+    }
+
     /// Send one request and wait for its response with a deadline.
     /// A server error is preserved verbatim as `ServerError`.
     pub fn request(
