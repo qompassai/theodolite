@@ -540,7 +540,7 @@ dependencies = [
 
 [[package]]
 name = "theodolite"
-version = "0.2.2"
+version = "1.0.0"
 dependencies = [
  "rmcp",
  "serde",
