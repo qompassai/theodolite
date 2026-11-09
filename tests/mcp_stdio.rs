@@ -317,6 +317,65 @@ fn document_symbols_flattened_sorted_with_containers() {
 }
 
 #[test]
+fn document_symbols_pre_quiescence_marked_never_bare() {
+    // Slice 0 adversarial (the Love Dolls shape): the server
+    // answers before its workspace has loaded and never reports
+    // quiescence. The empty outline must carry the marker, and
+    // hover is marked too — an unmarked empty would be a failed
+    // gate, not a pass.
+    let dir = temp_dir("prequiescent");
+    let ws = make_workspace(&dir);
+    let config = write_fake_config(&dir, "prequiescent", "", &[]);
+    let mut bridge = Bridge::spawn(&config);
+    let (is_error, result) = bridge.call_tool(
+        "document_symbols",
+        serde_json::json!({
+            "workspace": ws.to_string_lossy(), "server": "fake", "path": "main.rs"
+        }),
+    );
+    assert!(!is_error, "{result}");
+    assert_eq!(result["count"], 0, "{result}");
+    assert_eq!(
+        result["possibly_incomplete"], "server_not_quiescent",
+        "{result}"
+    );
+    let (is_error, hover) = bridge.call_tool("hover", hover_args(&ws));
+    assert!(!is_error, "{hover}");
+    assert_eq!(
+        hover["possibly_incomplete"], "server_not_quiescent",
+        "{hover}"
+    );
+    bridge.shutdown();
+}
+
+#[test]
+fn document_symbols_marker_clears_when_quiescence_lands() {
+    // Slice 0 validation: the same empty answer is marked while
+    // the load is in flight; once the server completes the load
+    // (progress end + quiescent report, in wire order ahead of
+    // the answer), the true symbols arrive unmarked.
+    let dir = temp_dir("latequiescent");
+    let ws = make_workspace(&dir);
+    let config = write_fake_config(&dir, "latequiescent", "", &[]);
+    let mut bridge = Bridge::spawn(&config);
+    let args = serde_json::json!({
+        "workspace": ws.to_string_lossy(), "server": "fake", "path": "main.rs"
+    });
+    let (is_error, first) = bridge.call_tool("document_symbols", args.clone());
+    assert!(!is_error, "{first}");
+    assert_eq!(first["count"], 0, "{first}");
+    assert_eq!(
+        first["possibly_incomplete"], "server_not_quiescent",
+        "{first}"
+    );
+    let (is_error, second) = bridge.call_tool("document_symbols", args);
+    assert!(!is_error, "{second}");
+    assert_eq!(second["count"], 3, "{second}");
+    assert!(second.get("possibly_incomplete").is_none(), "{second}");
+    bridge.shutdown();
+}
+
+#[test]
 fn diagnostics_waits_for_second_wave_and_sorts() {
     let dir = temp_dir("diagnostics");
     let ws = make_workspace(&dir);
@@ -1045,14 +1104,84 @@ fn workspace_symbols_over_budget_reports_true_count() {
     let (is_error, result) = bridge.call_tool(
         "workspace_symbols",
         serde_json::json!({
-            "workspace": ws.to_string_lossy(), "server": "fake", "query": "many"
+            "workspace": ws.to_string_lossy(), "server": "fake", "query": "huge"
         }),
     );
     assert!(is_error, "{result}");
     // Typed overflow with the true count — not a truncated list.
+    // The budget named is the 1 MiB symbol budget (B2), not the
+    // general 64 KiB result budget.
     assert_eq!(Bridge::error_code(&result), "ResultTooLarge");
-    assert_eq!(result["error"]["items"], 1500);
-    assert_eq!(result["error"]["budget_bytes"], 65_536);
+    assert_eq!(result["error"]["items"], 10_000);
+    assert_eq!(result["error"]["budget_bytes"], 1_048_576);
+    assert!(result.get("symbols").is_none(), "partial payload leaked");
+    bridge.shutdown();
+}
+
+#[test]
+fn workspace_symbols_many_returns_completely_with_stated_bound() {
+    // B2 validation: 1 500 workspace symbols overflowed the old
+    // 64 KiB budget; under the symbol budget they return whole,
+    // with the bound stated in the envelope.
+    let dir = temp_dir("workspace-symbols-many");
+    let ws = make_workspace(&dir);
+    let config = write_fake_config(&dir, "rich", "", &[]);
+    let mut bridge = Bridge::spawn(&config);
+    let (is_error, result) = bridge.call_tool(
+        "workspace_symbols",
+        serde_json::json!({
+            "workspace": ws.to_string_lossy(), "server": "fake", "query": "many"
+        }),
+    );
+    assert!(!is_error, "{result}");
+    assert_eq!(result["count"], 1500, "{result}");
+    assert_eq!(result["budget_bytes"], 1_048_576, "{result}");
+    bridge.shutdown();
+}
+
+#[test]
+fn document_symbols_large_outline_returns_completely_with_stated_bound() {
+    // B2 validation (the Diver client.lua shape): a 600-symbol
+    // outline exceeds the general 64 KiB budget and was refused
+    // whole before B2; under the symbol budget it returns
+    // complete, bound stated in the envelope.
+    let dir = temp_dir("symbols-big");
+    let ws = make_workspace(&dir);
+    let config = write_fake_config(&dir, "bigsymbols", "", &[]);
+    let mut bridge = Bridge::spawn(&config);
+    let (is_error, result) = bridge.call_tool(
+        "document_symbols",
+        serde_json::json!({
+            "workspace": ws.to_string_lossy(), "server": "fake", "path": "main.rs"
+        }),
+    );
+    assert!(!is_error, "{result}");
+    assert_eq!(result["count"], 600, "{result}");
+    assert_eq!(result["budget_bytes"], 1_048_576, "{result}");
+    assert_eq!(result["symbols"][0]["name"], "sym_0");
+    assert_eq!(result["symbols"][599]["name"], "sym_599");
+    bridge.shutdown();
+}
+
+#[test]
+fn document_symbols_huge_outline_is_typed_overflow_with_symbol_budget() {
+    // B2 adversarial: past even the symbol budget, the answer is
+    // the typed refusal carrying the true count and the symbol
+    // budget — never a silently truncated outline.
+    let dir = temp_dir("symbols-huge");
+    let ws = make_workspace(&dir);
+    let config = write_fake_config(&dir, "hugesymbols", "", &[]);
+    let mut bridge = Bridge::spawn(&config);
+    let (is_error, result) = bridge.call_tool(
+        "document_symbols",
+        serde_json::json!({
+            "workspace": ws.to_string_lossy(), "server": "fake", "path": "main.rs"
+        }),
+    );
+    assert!(is_error, "{result}");
+    assert_eq!(Bridge::error_code(&result), "ResultTooLarge");
+    assert_eq!(result["error"]["items"], 10_000);
+    assert_eq!(result["error"]["budget_bytes"], 1_048_576);
     assert!(result.get("symbols").is_none(), "partial payload leaked");
     bridge.shutdown();
 }

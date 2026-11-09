@@ -10,6 +10,17 @@ use crate::errors::{BridgeError, BridgeResult};
 /// Default per-tool result budget in bytes (SPEC §4.4).
 pub const MAX_RESULT_BYTES: usize = 65_536;
 
+/// Byte budget for symbol results (`document_symbols`,
+/// `workspace_symbols`). Symbol entries are small and an outline
+/// is only useful whole: a real 369-symbol module already exceeds
+/// the general 64 KiB budget (the Diver `client.lua` refusal that
+/// Slice B2 closes), so symbols carry a named, larger bound —
+/// 1 MiB, roughly five thousand typical entries. The bound is
+/// stated in every symbol result envelope (`budget_bytes`), and
+/// past it the refusal is the same typed `ResultTooLarge`
+/// carrying the true count — never a silent truncation.
+pub const MAX_SYMBOL_RESULT_BYTES: usize = 1_048_576;
+
 /// A position in a document, LSP convention (0-based line, UTF-16
 /// code-unit character).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]

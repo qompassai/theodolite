@@ -23,14 +23,15 @@
 
 use std::sync::Arc;
 
-use crate::config::Config;
+use crate::config::{Config, Readiness};
 use crate::edits::{FileEdits, render_file_list, shape_workspace_edit, total_edits};
 use crate::errors::{BridgeError, BridgeResult};
 use crate::session::{Session, SessionManager, resolve_within, validate_workspace};
 use crate::shaping::{
-    Diagnostic, Location, MAX_RESULT_BYTES, Position, Range, diagnostic_json, diagnostic_to_lsp,
-    enforce_budget, location_json, merge_diagnostics, parse_range, path_to_uri, range_json,
-    relativize_uri, sort_diagnostics, sort_locations, uri_to_path,
+    Diagnostic, Location, MAX_RESULT_BYTES, MAX_SYMBOL_RESULT_BYTES, Position, Range,
+    diagnostic_json, diagnostic_to_lsp, enforce_budget, location_json, merge_diagnostics,
+    parse_range, path_to_uri, range_json, relativize_uri, sort_diagnostics, sort_locations,
+    uri_to_path,
 };
 
 /// Tool names registered unconditionally (read class plus the
@@ -122,7 +123,10 @@ pub fn tool_definitions(config: &Config, client_identity: Option<&str>) -> serde
         ),
         tool(
             "diagnostics",
-            "Push diagnostics for the workspace, or one file when `path` is given. Sorted, byte-bounded.",
+            "Push diagnostics for the workspace, or one file when `path` is given. Sorted, byte-bounded. \
+             Read-class results served under immediate readiness before the server has ever reported \
+             quiescence carry possibly_incomplete: \"server_not_quiescent\" — such a result may predate \
+             workspace load and must not be read as a proven empty.",
             serde_json::json!({
                 "workspace": workspace, "server": server,
                 "path": {"type": "string", "description": "Optional single file to scope to."}
@@ -170,16 +174,21 @@ pub fn tool_definitions(config: &Config, client_identity: Option<&str>) -> serde
         ),
         tool(
             "document_symbols",
-            "Flattened document outline: name, kind, container, ranges, sorted by range.",
+            "Flattened document outline: name, kind, container, ranges, sorted by range. \
+             A count of 0 served before the server has ever reported quiescence is marked \
+             possibly_incomplete: \"server_not_quiescent\", never a bare empty. Symbol \
+             results carry a 1 MiB budget, stated as budget_bytes in the result; overflow \
+             past it is a typed ResultTooLarge with the true count.",
             serde_json::json!({"workspace": workspace, "server": server, "path": path}),
             &["workspace", "server", "path"],
         ),
         tool(
             "workspace_symbols",
             "Workspace-wide symbol search. Results are the server's own (no client-side \
-             name filtering), sorted per the canonical symbol key, byte-bounded: overflow \
-             is a typed ResultTooLarge carrying the true count. Typed UnsupportedMethod \
-             when the server does not advertise workspace-symbol support.",
+             name filtering), sorted per the canonical symbol key, bounded by the 1 MiB \
+             symbol budget (stated as budget_bytes in the result): overflow is a typed \
+             ResultTooLarge carrying the true count. Typed UnsupportedMethod when the \
+             server does not advertise workspace-symbol support.",
             serde_json::json!({
                 "workspace": workspace, "server": server,
                 "query": {"type": "string", "description": "Query string passed to the server verbatim; may be empty."}
@@ -355,6 +364,20 @@ fn require_u64(arguments: &serde_json::Value, field: &str) -> BridgeResult<u64> 
         .ok_or_else(|| BridgeError::InvalidArgument {
             detail: format!("argument {field:?} must be a non-negative integer"),
         })
+}
+
+/// Slice 0 distinguishability marker (SPEC §3; plan decision Q6:
+/// an additive payload field, never a new error class). Under
+/// `immediate` readiness, a result served while the server has
+/// never reported quiescence may predate workspace load, so the
+/// envelope carries `possibly_incomplete: "server_not_quiescent"`.
+/// Failure paths are unchanged, and consumers may ignore the
+/// field safely.
+fn mark_possibly_incomplete(session: &Session, result: &mut serde_json::Value) {
+    if session.entry.readiness == Readiness::Immediate && !session.quiescence_ever_reported() {
+        result["possibly_incomplete"] =
+            serde_json::Value::String("server_not_quiescent".to_string());
+    }
 }
 
 fn session_for(
@@ -623,6 +646,7 @@ fn tool_diagnostics(
             server_id, owner.id
         ));
     }
+    mark_possibly_incomplete(&session, &mut result);
     enforce_budget(&result, shaped.len(), MAX_RESULT_BYTES)?;
     Ok(result)
 }
@@ -635,15 +659,19 @@ fn tool_hover(
     let config: &Config = manager.config();
     let raw = session.request("textDocument/hover", params, config.request_timeout_ms)?;
     if raw.is_null() {
-        return Ok(serde_json::json!({"contents": null, "range": null}));
+        let mut result = serde_json::json!({"contents": null, "range": null});
+        mark_possibly_incomplete(&session, &mut result);
+        return Ok(result);
     }
     // Hover markup is preserved verbatim (SPEC §6); only the range
     // is normalized into the canonical range shape.
     let range = raw.get("range").map(|r| range_json(parse_range(r)));
-    Ok(serde_json::json!({
+    let mut result = serde_json::json!({
         "contents": raw.get("contents").cloned().unwrap_or(serde_json::Value::Null),
         "range": range.unwrap_or(serde_json::Value::Null),
-    }))
+    });
+    mark_possibly_incomplete(&session, &mut result);
+    Ok(result)
 }
 
 /// Normalize an LSP location-ish result (`Location | Location[] |
@@ -698,7 +726,8 @@ fn shape_location_result(
 ) -> BridgeResult<serde_json::Value> {
     let locations = shape_locations(session, raw)?;
     let items: Vec<serde_json::Value> = locations.iter().map(location_json).collect();
-    let result = serde_json::json!({"count": items.len(), "locations": items});
+    let mut result = serde_json::json!({"count": items.len(), "locations": items});
+    mark_possibly_incomplete(session, &mut result);
     enforce_budget(&result, locations.len(), MAX_RESULT_BYTES)?;
     Ok(result)
 }
@@ -887,12 +916,14 @@ fn tool_document_symbols(
         })
         .collect();
     let relative_uri = relativize_uri(&path_to_uri(&absolute), &session.workspace_root)?;
-    let result = serde_json::json!({
+    let mut result = serde_json::json!({
         "uri": relative_uri,
         "count": items.len(),
+        "budget_bytes": MAX_SYMBOL_RESULT_BYTES,
         "symbols": items,
     });
-    enforce_budget(&result, flat.len(), MAX_RESULT_BYTES)?;
+    mark_possibly_incomplete(&session, &mut result);
+    enforce_budget(&result, flat.len(), MAX_SYMBOL_RESULT_BYTES)?;
     Ok(result)
 }
 
@@ -989,8 +1020,13 @@ fn tool_workspace_symbols(
             })
         })
         .collect();
-    let result = serde_json::json!({"count": items.len(), "symbols": items});
-    enforce_budget(&result, symbols.len(), MAX_RESULT_BYTES)?;
+    let mut result = serde_json::json!({
+        "count": items.len(),
+        "budget_bytes": MAX_SYMBOL_RESULT_BYTES,
+        "symbols": items,
+    });
+    mark_possibly_incomplete(&session, &mut result);
+    enforce_budget(&result, symbols.len(), MAX_SYMBOL_RESULT_BYTES)?;
     Ok(result)
 }
 
@@ -1166,7 +1202,8 @@ fn tool_code_actions(
             item
         })
         .collect();
-    let result = serde_json::json!({"count": items.len(), "actions": items});
+    let mut result = serde_json::json!({"count": items.len(), "actions": items});
+    mark_possibly_incomplete(&session, &mut result);
     enforce_budget(&result, actions.len(), MAX_RESULT_BYTES)?;
     Ok(result)
 }
