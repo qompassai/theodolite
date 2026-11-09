@@ -28,9 +28,10 @@ use crate::edits::{FileEdits, render_file_list, shape_workspace_edit, total_edit
 use crate::errors::{BridgeError, BridgeResult};
 use crate::session::{Session, SessionManager, resolve_within, validate_workspace};
 use crate::shaping::{
-    Diagnostic, Location, MAX_RESULT_BYTES, Position, Range, diagnostic_json, diagnostic_to_lsp,
-    enforce_budget, location_json, merge_diagnostics, parse_range, path_to_uri, range_json,
-    relativize_uri, sort_diagnostics, sort_locations, uri_to_path,
+    Diagnostic, Location, MAX_RESULT_BYTES, MAX_SYMBOL_RESULT_BYTES, Position, Range,
+    diagnostic_json, diagnostic_to_lsp, enforce_budget, location_json, merge_diagnostics,
+    parse_range, path_to_uri, range_json, relativize_uri, sort_diagnostics, sort_locations,
+    uri_to_path,
 };
 
 /// Tool names registered unconditionally (read class plus the
@@ -175,16 +176,19 @@ pub fn tool_definitions(config: &Config, client_identity: Option<&str>) -> serde
             "document_symbols",
             "Flattened document outline: name, kind, container, ranges, sorted by range. \
              A count of 0 served before the server has ever reported quiescence is marked \
-             possibly_incomplete: \"server_not_quiescent\", never a bare empty.",
+             possibly_incomplete: \"server_not_quiescent\", never a bare empty. Symbol \
+             results carry a 1 MiB budget, stated as budget_bytes in the result; overflow \
+             past it is a typed ResultTooLarge with the true count.",
             serde_json::json!({"workspace": workspace, "server": server, "path": path}),
             &["workspace", "server", "path"],
         ),
         tool(
             "workspace_symbols",
             "Workspace-wide symbol search. Results are the server's own (no client-side \
-             name filtering), sorted per the canonical symbol key, byte-bounded: overflow \
-             is a typed ResultTooLarge carrying the true count. Typed UnsupportedMethod \
-             when the server does not advertise workspace-symbol support.",
+             name filtering), sorted per the canonical symbol key, bounded by the 1 MiB \
+             symbol budget (stated as budget_bytes in the result): overflow is a typed \
+             ResultTooLarge carrying the true count. Typed UnsupportedMethod when the \
+             server does not advertise workspace-symbol support.",
             serde_json::json!({
                 "workspace": workspace, "server": server,
                 "query": {"type": "string", "description": "Query string passed to the server verbatim; may be empty."}
@@ -915,10 +919,11 @@ fn tool_document_symbols(
     let mut result = serde_json::json!({
         "uri": relative_uri,
         "count": items.len(),
+        "budget_bytes": MAX_SYMBOL_RESULT_BYTES,
         "symbols": items,
     });
     mark_possibly_incomplete(&session, &mut result);
-    enforce_budget(&result, flat.len(), MAX_RESULT_BYTES)?;
+    enforce_budget(&result, flat.len(), MAX_SYMBOL_RESULT_BYTES)?;
     Ok(result)
 }
 
@@ -1017,10 +1022,11 @@ fn tool_workspace_symbols(
         .collect();
     let mut result = serde_json::json!({
         "count": items.len(),
+        "budget_bytes": MAX_SYMBOL_RESULT_BYTES,
         "symbols": items,
     });
     mark_possibly_incomplete(&session, &mut result);
-    enforce_budget(&result, symbols.len(), MAX_RESULT_BYTES)?;
+    enforce_budget(&result, symbols.len(), MAX_SYMBOL_RESULT_BYTES)?;
     Ok(result)
 }
 

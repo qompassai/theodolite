@@ -1104,20 +1104,87 @@ fn workspace_symbols_over_budget_reports_true_count() {
     let (is_error, result) = bridge.call_tool(
         "workspace_symbols",
         serde_json::json!({
-            "workspace": ws.to_string_lossy(), "server": "fake", "query": "many"
+            "workspace": ws.to_string_lossy(), "server": "fake", "query": "huge"
         }),
     );
     assert!(is_error, "{result}");
     // Typed overflow with the true count — not a truncated list.
+    // The budget named is the 1 MiB symbol budget (B2), not the
+    // general 64 KiB result budget.
     assert_eq!(Bridge::error_code(&result), "ResultTooLarge");
-    assert_eq!(result["error"]["items"], 1500);
-    assert_eq!(result["error"]["budget_bytes"], 65_536);
+    assert_eq!(result["error"]["items"], 10_000);
+    assert_eq!(result["error"]["budget_bytes"], 1_048_576);
     assert!(result.get("symbols").is_none(), "partial payload leaked");
     bridge.shutdown();
 }
 
+#[test]
+fn workspace_symbols_many_returns_completely_with_stated_bound() {
+    // B2 validation: 1 500 workspace symbols overflowed the old
+    // 64 KiB budget; under the symbol budget they return whole,
+    // with the bound stated in the envelope.
+    let dir = temp_dir("workspace-symbols-many");
+    let ws = make_workspace(&dir);
+    let config = write_fake_config(&dir, "rich", "", &[]);
+    let mut bridge = Bridge::spawn(&config);
+    let (is_error, result) = bridge.call_tool(
+        "workspace_symbols",
+        serde_json::json!({
+            "workspace": ws.to_string_lossy(), "server": "fake", "query": "many"
+        }),
+    );
+    assert!(!is_error, "{result}");
+    assert_eq!(result["count"], 1500, "{result}");
+    assert_eq!(result["budget_bytes"], 1_048_576, "{result}");
+    bridge.shutdown();
+}
 
+#[test]
+fn document_symbols_large_outline_returns_completely_with_stated_bound() {
+    // B2 validation (the Diver client.lua shape): a 600-symbol
+    // outline exceeds the general 64 KiB budget and was refused
+    // whole before B2; under the symbol budget it returns
+    // complete, bound stated in the envelope.
+    let dir = temp_dir("symbols-big");
+    let ws = make_workspace(&dir);
+    let config = write_fake_config(&dir, "bigsymbols", "", &[]);
+    let mut bridge = Bridge::spawn(&config);
+    let (is_error, result) = bridge.call_tool(
+        "document_symbols",
+        serde_json::json!({
+            "workspace": ws.to_string_lossy(), "server": "fake", "path": "main.rs"
+        }),
+    );
+    assert!(!is_error, "{result}");
+    assert_eq!(result["count"], 600, "{result}");
+    assert_eq!(result["budget_bytes"], 1_048_576, "{result}");
+    assert_eq!(result["symbols"][0]["name"], "sym_0");
+    assert_eq!(result["symbols"][599]["name"], "sym_599");
+    bridge.shutdown();
+}
 
+#[test]
+fn document_symbols_huge_outline_is_typed_overflow_with_symbol_budget() {
+    // B2 adversarial: past even the symbol budget, the answer is
+    // the typed refusal carrying the true count and the symbol
+    // budget — never a silently truncated outline.
+    let dir = temp_dir("symbols-huge");
+    let ws = make_workspace(&dir);
+    let config = write_fake_config(&dir, "hugesymbols", "", &[]);
+    let mut bridge = Bridge::spawn(&config);
+    let (is_error, result) = bridge.call_tool(
+        "document_symbols",
+        serde_json::json!({
+            "workspace": ws.to_string_lossy(), "server": "fake", "path": "main.rs"
+        }),
+    );
+    assert!(is_error, "{result}");
+    assert_eq!(Bridge::error_code(&result), "ResultTooLarge");
+    assert_eq!(result["error"]["items"], 10_000);
+    assert_eq!(result["error"]["budget_bytes"], 1_048_576);
+    assert!(result.get("symbols").is_none(), "partial payload leaked");
+    bridge.shutdown();
+}
 
 #[test]
 fn code_actions_payloads_never_reach_the_result() {

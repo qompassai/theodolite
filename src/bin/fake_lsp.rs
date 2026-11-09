@@ -45,8 +45,11 @@
 //! before answering the second — closes the window and reports
 //! `experimental/serverStatus` quiescent, after which the
 //! standard symbol set is served — the load-completes shape,
-//! for the marker's clearing gate). The `rich` mode also
-//! serves rename:
+//! for the marker's clearing gate), `bigsymbols` / `hugesymbols`
+//! (flat document-symbol outlines of 600 / 10 000 entries — the
+//! symbol-budget sizes for the B2 gates; the workspace-symbol
+//! queries `many` / `huge` answer the same two sizes). The
+//! `rich` mode also serves rename:
 //! `prepareRename` (null at line 99 — not renameable) and `rename`
 //! with scripted edit sets keyed by the requested new name
 //! (`docchanges` = the documentChanges wire shape, `fileops` = a
@@ -182,6 +185,35 @@ impl Fake {
                     "error": {"code": -32803, "message": "still indexing"}
                 }),
             );
+            return true;
+        }
+        if (self.mode == "bigsymbols" || self.mode == "hugesymbols")
+            && method == "textDocument/documentSymbol"
+        {
+            // Flat SymbolInformation outlines at two sizes:
+            // `bigsymbols` = 600 entries (past the general
+            // 64 KiB budget, inside the 1 MiB symbol budget);
+            // `hugesymbols` = 10 000 (past both).
+            let count: u64 = if self.mode == "hugesymbols" {
+                10_000
+            } else {
+                600
+            };
+            let root = self.root_uri.clone();
+            let items: Vec<serde_json::Value> = (0..count)
+                .map(|line| {
+                    serde_json::json!({
+                        "name": format!("sym_{line}"),
+                        "kind": 6,
+                        "location": {
+                            "uri": format!("{root}/main.rs"),
+                            "range": range(line, 0, line, 7)
+                        },
+                        "containerName": "big"
+                    })
+                })
+                .collect();
+            respond(writer, id, serde_json::Value::Array(items));
             return true;
         }
         if self.mode == "prequiescent" && method == "textDocument/documentSymbol" {
@@ -484,10 +516,14 @@ impl Fake {
                     .and_then(serde_json::Value::as_str)
                     .unwrap_or_default();
                 let root = self.root_uri.clone();
-                if query == "many" {
-                    // Budget stress: 1 500 symbols — well past the
-                    // 64 KiB shaped-result budget.
-                    let many: Vec<serde_json::Value> = (0..1500u64)
+                if query == "many" || query == "huge" {
+                    // Budget stress, two sizes: `many` = 1 500
+                    // symbols (past the general 64 KiB budget,
+                    // inside the 1 MiB symbol budget — served
+                    // whole); `huge` = 10 000 (past even the
+                    // symbol budget — a typed overflow).
+                    let count: u64 = if query == "huge" { 10_000 } else { 1_500 };
+                    let many: Vec<serde_json::Value> = (0..count)
                         .map(|line| {
                             serde_json::json!({
                                 "name": format!("symbol_{line}"),
