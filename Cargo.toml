@@ -25,5 +25,12 @@ toml = "0.9"
 rmcp = { version = "=3.8.0", default-features = false, features = ["server"] }
 tokio = { version = "1", features = ["io-std", "io-util", "macros", "rt-multi-thread", "sync"] }
 
+# Workspace: the root package stays the bridge; the fleet TUI
+# (programme D-1562) is a member crate so it versions and gates
+# independently of the server bins.
+[workspace]
+members = ["crates/theodolite-tui"]
+resolver = "2"
+
 [profile.release]
 debug = false

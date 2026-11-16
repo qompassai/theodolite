@@ -1,0 +1,23 @@
+# theodolite trigger rules (fleet TUI programme DESIGN SS D4).
+#
+# Rules are data, not code: the trigger engine loads this file at
+# startup and the Fleet panel lists exactly what is declared here.
+# A rule not present in this file does not exist. Birth stamps
+# (origin_lane + content_label) follow the BLOCH lane law (D-1030):
+# this member is qompass/sfw, and every audit line and firing
+# carries the stamps from the rule.
+
+# Rule #1 (DESIGN SS D4 worked example 1): a diagnostics run that
+# completes with errors becomes a bloch lesson candidate. The
+# candidate is a draft — bloch's own intake decides acceptance —
+# so auto mode is within the gate law: the trigger asks, the
+# target decides.
+[[rule]]
+id = "theodolite-diag-to-bloch-lesson"
+origin_lane = "qompass"
+content_label = "sfw"
+on = { event = "diagnostics.completed", where = "error_count > 0" }
+then = { mcp = "bloch", tool = "lesson_candidate", args_from = "event" }
+mode = "auto"
+idempotency = "event-hash"
+max_depth = 1

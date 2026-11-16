@@ -1,0 +1,27 @@
+[package]
+name = "theodolite-tui"
+version = "0.1.0"
+edition = "2024"
+description = "Fleet-pattern TUI for theodolite: session console, diagnostics workflows with live log streaming, and the cross-MCP trigger layer."
+license = "Apache-2.0"
+
+[[bin]]
+name = "theodolite-tui"
+path = "src/main.rs"
+
+[dependencies]
+# The member's own library crate: the real facade programs against
+# `theodolite::tools::call_tool` + `SessionManager` directly (DESIGN
+# SS D2: prefer the lib; an MCP stdio client only where the lib does
+# not reach).
+theodolite = { path = "../.." }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+# Rule files are TOML data, parsed with the same toml crate the
+# member already pins.
+toml = "0.9"
+sha2 = "0.10"
+# ratatui + crossterm: the fleet TUI pattern's rendering pair, at the
+# versions phlow-tui (the reference pattern) uses.
+ratatui = "0.30"
+crossterm = "0.29"
