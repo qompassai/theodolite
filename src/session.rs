@@ -164,6 +164,15 @@ struct Inner {
     last_sync_seq: u64,
     last_progress_end_seq: u64,
     last_quiescent_seq: u64,
+    /// Wall-clock stamp of the most recent CONTENT sync
+    /// (didOpen/didChange/didClose: a presentation of bytes the
+    /// server must analyze). didSave re-assertions deliberately
+    /// do not stamp it — they present the same bytes again, and
+    /// the settle wait's silence window (see
+    /// `Session::wait_diagnostics_settled`) is measured from the
+    /// presentation that created the analysis obligation, never
+    /// from the bridge's own retries of that presentation.
+    last_content_sync_at: Option<Instant>,
     progress_completed: u64,
     /// The server's advertised capabilities, captured verbatim from
     /// the `initialize` result (P3). Feature support is read from
@@ -219,6 +228,7 @@ impl SessionState {
                 last_sync_seq: 0,
                 last_progress_end_seq: 0,
                 last_quiescent_seq: 0,
+                last_content_sync_at: None,
                 progress_completed: 0,
                 server_capabilities: serde_json::Value::Null,
                 probe_outcome: None,
@@ -260,6 +270,14 @@ impl SessionState {
         let seq = inner.event_seq;
         inner.doc_sync_seq.insert(uri.to_string(), seq);
         inner.last_sync_seq = seq;
+    }
+
+    /// Stamp a content sync (didOpen/didChange/didClose): the
+    /// sequence stamp every sync gets, plus the wall-clock stamp
+    /// the settle wait's silence window is measured from.
+    fn note_content_sync(&self, uri: &str) {
+        self.note_sync(uri);
+        self.lock().last_content_sync_at = Some(Instant::now());
     }
 
     fn record_violation(&self, what: String) {
@@ -733,7 +751,7 @@ impl Session {
         if metadata.is_err() {
             let was_open = self.state.lock().documents.remove(&key).is_some();
             if was_open {
-                self.state.note_sync(&uri);
+                self.state.note_content_sync(&uri);
                 self.notify(
                     "textDocument/didClose",
                     serde_json::json!({"textDocument": {"uri": uri}}),
@@ -753,7 +771,7 @@ impl Session {
             Some(doc) => {
                 let version = doc.version + 1;
                 let text = String::from_utf8_lossy(&content).into_owned();
-                self.state.note_sync(&uri);
+                self.state.note_content_sync(&uri);
                 self.notify(
                     "textDocument/didChange",
                     serde_json::json!({
@@ -788,7 +806,7 @@ impl Session {
                         ),
                     })?;
                 let text = String::from_utf8_lossy(&content).into_owned();
-                self.state.note_sync(&uri);
+                self.state.note_content_sync(&uri);
                 self.notify(
                     "textDocument/didOpen",
                     serde_json::json!({
@@ -1095,6 +1113,25 @@ impl Session {
     /// A server offering none of these surfaces never settles and
     /// the call fails with the typed `ServerNotReady` at the ready
     /// deadline — a loud error in place of a confident empty set.
+    ///
+    /// The one scoped exception is a stanza opt-in
+    /// (`no_publish_means_empty_ms`, config.rs): a server whose
+    /// contract is "publishes only non-empty diagnostic sets,
+    /// promptly" (nil, measured 2026-11-15/16 — a clean file gets
+    /// no `publishDiagnostics` at all, so the evidence above can
+    /// never exist for exactly the files whose answer is empty).
+    /// For an opted-in server only, a full window of silence
+    /// after the last content sync — nothing in flight, the
+    /// diagnostics generation stable across two polls — settles
+    /// the wait, and the accumulated set (empty for a clean file)
+    /// is the answer. The window runs from the last CONTENT sync:
+    /// the bridge's own didSave re-assertions below present the
+    /// same bytes again and must not restart it, or the window
+    /// could never elapse. Servers without the opt-in never take
+    /// this branch: their silence still fails `ServerNotReady`,
+    /// and a publish that arrives inside the window is ordinary
+    /// evidence and wins over the silence branch, which is only
+    /// consulted while no evidence exists.
     fn wait_diagnostics_settled(
         &self,
         config: &Config,
@@ -1102,6 +1139,10 @@ impl Session {
     ) -> BridgeResult<()> {
         let deadline = Instant::now() + Duration::from_millis(config.ready_timeout_ms);
         let pull_advertised = self.supports_pull_diagnostics();
+        let silence_window = self
+            .entry
+            .no_publish_means_empty_ms
+            .map(Duration::from_millis);
         let mut last_generation: Option<u64> = None;
         let mut next_resave = Instant::now() + Duration::from_millis(DID_SAVE_RETRY_MS);
         loop {
@@ -1111,15 +1152,29 @@ impl Session {
                     detail,
                 });
             }
-            let (generation, in_flight, evidence) = {
+            let (generation, in_flight, evidence, last_content_sync_at) = {
                 let inner = self.state.lock();
                 (
                     inner.diagnostics_generation,
                     inner.progress_tokens.len(),
                     settle_evidence(&inner, only_uri, pull_advertised),
+                    inner.last_content_sync_at,
                 )
             };
             if in_flight == 0 && last_generation == Some(generation) && evidence {
+                return Ok(());
+            }
+            if !evidence
+                && in_flight == 0
+                && last_generation == Some(generation)
+                && let Some(window) = silence_window
+                && let Some(synced_at) = last_content_sync_at
+                && synced_at.elapsed() >= window
+            {
+                // The opted-in server's empty set, reported as
+                // silence (see the predicate docs above). The
+                // accumulation the caller collects next is the
+                // answer; for a clean file it is empty.
                 return Ok(());
             }
             last_generation = Some(generation);
