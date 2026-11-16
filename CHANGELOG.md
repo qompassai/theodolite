@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## 1.0.1 — 2026-11-16
+
 - **Nil-route clean-file fix.** The diagnostics settle wait
   required protocol evidence (a publish, a progress completion,
   or a quiescent report) postdating the last document sync —
