@@ -1995,6 +1995,114 @@ fn diagnostics_without_any_evidence_hits_the_ready_deadline() {
     bridge.shutdown();
 }
 
+/// Write a bridge config like `write_fake_config`, with the
+/// server stanza's `no_publish_means_empty_ms` opt-in appended
+/// (the stanza is the generated file's last table, so a trailing
+/// key lands inside it).
+fn write_fake_config_silence(dir: &Path, mode: &str, extra_top: &str, window_ms: u64) -> PathBuf {
+    let path = write_fake_config(dir, mode, extra_top, &[]);
+    let body = std::fs::read_to_string(&path).expect("read generated config");
+    std::fs::write(
+        &path,
+        format!("{body}no_publish_means_empty_ms = {window_ms}\n"),
+    )
+    .expect("append silence opt-in");
+    path
+}
+
+#[test]
+fn diagnostics_silence_means_empty_for_an_opted_in_server() {
+    let dir = temp_dir("never-publish-silence");
+    let ws = make_workspace(&dir);
+    let config = write_fake_config_silence(&dir, "never-publish", "ready_timeout_ms = 30000", 1000);
+    let mut bridge = Bridge::spawn(&config);
+    // The same silent fake as the ready-deadline test above, but
+    // the stanza opts in to silence semantics with a 1 s window:
+    // the call must succeed with an empty set once the window has
+    // run — not fail at the ready deadline, and not return before
+    // the window (a return inside it could not yet distinguish
+    // "empty" from "not yet published").
+    let started = Instant::now();
+    let (is_error, result) = bridge.call_tool(
+        "diagnostics",
+        serde_json::json!({
+            "workspace": ws.to_string_lossy(), "server": "fake", "path": "main.rs"
+        }),
+    );
+    let elapsed = started.elapsed();
+    assert!(!is_error, "{result}");
+    assert_eq!(result["count"], 0, "{result}");
+    assert!(
+        elapsed >= Duration::from_millis(900),
+        "diagnostics returned after {elapsed:?}, before the silence window ran"
+    );
+    assert!(
+        elapsed < Duration::from_secs(15),
+        "diagnostics took {elapsed:?}; the window did not bound the wait"
+    );
+    bridge.shutdown();
+}
+
+#[test]
+fn diagnostics_evidence_inside_the_window_still_wins() {
+    let dir = temp_dir("late-publish-silence");
+    let ws = make_workspace(&dir);
+    let config = write_fake_config_silence(&dir, "late-publish", "ready_timeout_ms = 30000", 8000);
+    let mut bridge = Bridge::spawn(&config);
+    // The fake publishes ~3 s after didOpen, inside the 8 s
+    // silence window: the publish is evidence and must be what
+    // the call returns. The silence branch is only consulted
+    // while no evidence exists; it never pre-empts a publish
+    // that arrives inside the window.
+    let started = Instant::now();
+    let (is_error, result) = bridge.call_tool(
+        "diagnostics",
+        serde_json::json!({
+            "workspace": ws.to_string_lossy(), "server": "fake", "path": "main.rs"
+        }),
+    );
+    let elapsed = started.elapsed();
+    assert!(!is_error, "{result}");
+    assert_eq!(result["count"], 1, "{result}");
+    assert_eq!(
+        result["diagnostics"][0]["message"],
+        "late arrival diagnostic"
+    );
+    assert!(
+        elapsed >= Duration::from_millis(2_500),
+        "diagnostics returned after {elapsed:?}; it did not wait for the publish"
+    );
+    bridge.shutdown();
+}
+
+#[test]
+fn diagnostics_silence_window_closing_first_returns_the_empty_set() {
+    let dir = temp_dir("late-publish-preempted");
+    let ws = make_workspace(&dir);
+    let config = write_fake_config_silence(&dir, "late-publish", "ready_timeout_ms = 30000", 500);
+    let mut bridge = Bridge::spawn(&config);
+    // The opt-in's contract, pinned: a publish that lands AFTER
+    // the window is indistinguishable from silence, so the
+    // empty set stands. Opting a server in asserts it publishes
+    // promptly or never (nil's measured shape); a slow publisher
+    // must not be opted in.
+    let started = Instant::now();
+    let (is_error, result) = bridge.call_tool(
+        "diagnostics",
+        serde_json::json!({
+            "workspace": ws.to_string_lossy(), "server": "fake", "path": "main.rs"
+        }),
+    );
+    let elapsed = started.elapsed();
+    assert!(!is_error, "{result}");
+    assert_eq!(result["count"], 0, "{result}");
+    assert!(
+        elapsed < Duration::from_millis(2_500),
+        "diagnostics took {elapsed:?}; it waited for the late publish despite the window"
+    );
+    bridge.shutdown();
+}
+
 // --- First-response readiness ------------------------------------------
 
 #[test]

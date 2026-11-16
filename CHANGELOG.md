@@ -1,5 +1,27 @@
 # Changelog
 
+## Unreleased
+
+- **Nil-route clean-file fix.** The diagnostics settle wait
+  required protocol evidence (a publish, a progress completion,
+  or a quiescent report) postdating the last document sync —
+  but nil publishes `publishDiagnostics` only for non-empty
+  sets, so a clean .nix file produced no evidence, ever, and
+  the call held to the ready deadline and failed
+  `ServerNotReady` instead of returning the empty set. New
+  per-server stanza opt-in `no_publish_means_empty_ms`
+  (validated 250..=120000, and required to sit below
+  `ready_timeout_ms`): for an opted-in server only, a full
+  window of silence after the last content sync — nothing in
+  flight, diagnostics generation stable across two polls —
+  settles the wait with the accumulated (empty) set. The
+  window is measured from the last content sync
+  (didOpen/didChange/didClose); the bridge's own didSave
+  re-assertions do not restart it. Servers without the opt-in
+  are unchanged: silence still fails `ServerNotReady`, the
+  Rust route's evidence rule is untouched, and a publish
+  arriving inside the window still wins.
+
 ## 1.0.0 — 2026-11-09
 
 The coverage release. Theodolite's claim is now an in-tree

@@ -65,6 +65,32 @@ language_ids = { lua = "lua" }
 readiness = "immediate"
 env = {}
 
+# nil (Nix): nil publishes publishDiagnostics ONLY for non-empty
+# sets — a clean file gets no notification at all, so the
+# bridge's evidence-based settle wait can never settle for
+# exactly the files whose answer is empty, and the call fails
+# ServerNotReady at the ready deadline. The opt-in below is the
+# scoped cure: after 5000 ms of silence following the last
+# content sync (nothing in flight, diagnostics generation
+# stable), the absent publish IS the empty set. nil's publish
+# for a dirty file lands in ~0.6 s, so the window carries ~8x
+# headroom. NEVER opt in a server that publishes empty sets or
+# publishes slowly: for every server without the opt-in,
+# silence stays ServerNotReady, and a publish arriving after
+# the window is indistinguishable from silence.
+[[server]]
+id = "nil"
+binary = "/usr/bin/nil"
+version_probe = ["--version"]
+expect_version = "RECORD-ON-TARGET-MACHINE"
+languages = ["nix"]
+extensions = ["nix"]
+language_ids = { nix = "nix" }
+readiness = "immediate"
+diagnostics_owner = true
+no_publish_means_empty_ms = 5000
+env = { PATH = "/usr/local/bin:/usr/bin:/bin" }
+
 # serve-d (D): plain stdio LSP, no argv — upstream's `--require`
 # values are feature names (`d`, `workspaces`), never component
 # names; an unsupported value makes serve-d refuse to start.

@@ -29,6 +29,17 @@ pub const DEFAULT_READY_TIMEOUT_MS: u64 = 30_000;
 /// Default shutdown grace when the config omits it (SPEC §3.6).
 pub const DEFAULT_SHUTDOWN_GRACE_MS: u64 = 2_000;
 
+/// Lower bound for a server's `no_publish_means_empty_ms` opt-in:
+/// below one settle poll (250 ms) the window cannot be told apart
+/// from "no publish yet", so the config refuses it instead of
+/// letting it silently mean something else.
+pub const NO_PUBLISH_MEANS_EMPTY_MS_MIN: u64 = 250;
+/// Upper bound for the same opt-in: the window is a bounded wait
+/// inside the ready deadline, not a second deadline. Two minutes
+/// is far past the measured publish latency of every server whose
+/// contract is "publishes promptly or never".
+pub const NO_PUBLISH_MEANS_EMPTY_MS_MAX: u64 = 120_000;
+
 /// Readiness predicate named by a server entry (SPEC §7).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Readiness {
@@ -90,6 +101,16 @@ pub struct ServerEntry {
     /// Whether this entry owns workspace diagnostics for parity
     /// purposes (bacon-ls in the v1 set).
     pub diagnostics_owner: bool,
+    /// Opt-in silence semantics for this server's diagnostics
+    /// channel: the server publishes `publishDiagnostics` only
+    /// for non-empty sets, so once this many milliseconds have
+    /// passed since the last content sync with no diagnostics
+    /// evidence, an absent publish IS the empty set (the nil
+    /// shape, measured 2026-11-15/16: a clean file gets no
+    /// notification at all, ever). `None` (the default) keeps the
+    /// evidence-only settle predicate: silence is a typed
+    /// `ServerNotReady` at the ready deadline, never a zero.
+    pub no_publish_means_empty_ms: Option<u64>,
 }
 
 /// Mutation posture (SPEC §6): a configuration state, never a
@@ -169,6 +190,7 @@ struct RawServer {
     settings: Option<serde_json::Value>,
     #[serde(default)]
     diagnostics_owner: bool,
+    no_publish_means_empty_ms: Option<u64>,
 }
 
 impl Config {
@@ -246,10 +268,25 @@ impl Config {
             seen_ids.push(entry.id.as_str());
             servers.push(validate_server(entry)?);
         }
+        let ready_timeout_ms = raw.ready_timeout_ms.unwrap_or(DEFAULT_READY_TIMEOUT_MS);
+        for entry in &servers {
+            if let Some(window) = entry.no_publish_means_empty_ms
+                && window >= ready_timeout_ms
+            {
+                return Err(BridgeError::ConfigInvalid {
+                    detail: format!(
+                        "server {:?}: no_publish_means_empty_ms {window} must be below \
+                         ready_timeout_ms {ready_timeout_ms}; the ready deadline would \
+                         expire first and the opt-in could never fire",
+                        entry.id
+                    ),
+                });
+            }
+        }
         Ok(Config {
             servers,
             request_timeout_ms: raw.request_timeout_ms.unwrap_or(DEFAULT_REQUEST_TIMEOUT_MS),
-            ready_timeout_ms: raw.ready_timeout_ms.unwrap_or(DEFAULT_READY_TIMEOUT_MS),
+            ready_timeout_ms,
             shutdown_grace_ms: raw.shutdown_grace_ms.unwrap_or(DEFAULT_SHUTDOWN_GRACE_MS),
             config_hash,
             mutation,
@@ -306,6 +343,17 @@ fn validate_server(raw: &RawServer) -> BridgeResult<ServerEntry> {
             detail: format!("server {:?}: extensions must not be empty", raw.id),
         });
     }
+    if let Some(window) = raw.no_publish_means_empty_ms
+        && !(NO_PUBLISH_MEANS_EMPTY_MS_MIN..=NO_PUBLISH_MEANS_EMPTY_MS_MAX).contains(&window)
+    {
+        return Err(BridgeError::ConfigInvalid {
+            detail: format!(
+                "server {:?}: no_publish_means_empty_ms {window} is outside the supported \
+                 range {NO_PUBLISH_MEANS_EMPTY_MS_MIN}..={NO_PUBLISH_MEANS_EMPTY_MS_MAX}",
+                raw.id
+            ),
+        });
+    }
     let language_ids = resolve_language_ids(raw)?;
     Ok(ServerEntry {
         id: raw.id.clone(),
@@ -321,6 +369,7 @@ fn validate_server(raw: &RawServer) -> BridgeResult<ServerEntry> {
         initialization_options: raw.initialization_options.clone(),
         settings: raw.settings.clone(),
         diagnostics_owner: raw.diagnostics_owner,
+        no_publish_means_empty_ms: raw.no_publish_means_empty_ms,
     })
 }
 

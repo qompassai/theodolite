@@ -99,6 +99,21 @@ fn config_first_response_readiness_loads() {
 }
 
 #[test]
+fn config_no_publish_means_empty_loads_and_defaults_to_none() {
+    let dir = temp_dir("cfg-silence");
+    // The key lands inside the server stanza (it is the file's
+    // last table), opting that one server in to silence
+    // semantics with a 5 s window.
+    let body = format!("{VALID_SERVER}no_publish_means_empty_ms = 5000\n");
+    let config = Config::load(&write_config(&dir, &body)).expect("silence opt-in loads");
+    assert_eq!(config.servers[0].no_publish_means_empty_ms, Some(5000));
+    // Absent the key the opt-in is off: silence stays an error,
+    // never a default.
+    let config = Config::load(&write_config(&dir, VALID_SERVER)).expect("default loads");
+    assert_eq!(config.servers[0].no_publish_means_empty_ms, None);
+}
+
+#[test]
 fn config_gated_with_allowlist_loads() {
     let dir = temp_dir("cfg-gated");
     let body =
@@ -307,6 +322,25 @@ fn config_violations_are_typed_config_invalid() {
     // Unknown readiness predicate.
     let readiness = VALID_SERVER.replace("immediate", "whenever");
     let error = Config::load(&write_config(&dir, &readiness)).expect_err("bad readiness");
+    assert_eq!(error.code(), "ConfigInvalid");
+}
+
+#[test]
+fn config_no_publish_means_empty_out_of_bounds_is_refused() {
+    let dir = temp_dir("cfg-silence-bad");
+    // Below the floor: indistinguishable from "no publish yet".
+    let body = format!("{VALID_SERVER}no_publish_means_empty_ms = 100\n");
+    let error = Config::load(&write_config(&dir, &body)).expect_err("sub-floor window refused");
+    assert_eq!(error.code(), "ConfigInvalid");
+    // Above the ceiling: a second deadline, not a bounded wait.
+    let body = format!("{VALID_SERVER}no_publish_means_empty_ms = 120001\n");
+    let error = Config::load(&write_config(&dir, &body)).expect_err("over-ceiling refused");
+    assert_eq!(error.code(), "ConfigInvalid");
+    // At or past the ready deadline: the ready deadline would
+    // expire first, so the opt-in could never fire — a config
+    // that silently does nothing is refused, not carried.
+    let body = format!("ready_timeout_ms = 3000\n{VALID_SERVER}no_publish_means_empty_ms = 5000\n");
+    let error = Config::load(&write_config(&dir, &body)).expect_err("window past deadline");
     assert_eq!(error.code(), "ConfigInvalid");
 }
 
