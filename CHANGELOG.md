@@ -2,6 +2,28 @@
 
 ## Unreleased
 
+- **GDShader route: legacy `rootPath` opt-in.** gdshader-lsp
+  0.1.0 reads its project root only from the deprecated
+  `rootPath` initialize param (its `main.rs`) and loads its
+  builtin functions only when a root exists; the bridge sent
+  the modern shape (`rootUri` / `workspaceFolders`) only, so
+  through the bridge every builtin call false-positived
+  ("Function 'vec3' does not exist") and the route could not
+  be wired (SHADER-ADDENDUM item 4). New per-server stanza
+  opt-in `send_root_path` (default off): for an opted-in
+  server only, `initialize` also carries `rootPath`, the
+  filesystem path behind `rootUri`. Stanzas without the
+  opt-in are unchanged — no deprecated field is sent to a
+  server that did not ask for it. Gates: config parse
+  (opt-in loads, defaults off, non-bool refused), fake-lsp
+  `rootpath` mode echoing the received field through
+  documentSymbol (opt-in lands verbatim, default absent),
+  and the live gdshader gate through the bridge in one
+  session — bad 1 ("Expected Semicolon"), good 0 with the
+  positive control live in the same session, so the zero is
+  verified — with glsld (1 / 0) and Lua (bad 6 / good 0,
+  sacrificial first query) regression reads unchanged.
+
 ## 1.0.1 — 2026-11-16
 
 - **Nil-route clean-file fix.** The diagnostics settle wait

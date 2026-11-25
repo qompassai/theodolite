@@ -95,6 +95,21 @@ fn write_fake_config_readiness(
     path
 }
 
+/// Write a bridge config naming one fake server in `mode`, with
+/// the legacy-root opt-in line added inside the stanza (the
+/// readiness helper's string-surgery idiom).
+fn write_fake_config_root_path(dir: &Path, mode: &str) -> PathBuf {
+    let path = write_fake_config(dir, mode, "", &[]);
+    let body = std::fs::read_to_string(&path).expect("read generated config");
+    let replaced = body.replace(
+        "readiness = \"immediate\"",
+        "readiness = \"immediate\"\nsend_root_path = true",
+    );
+    assert_ne!(body, replaced, "generated config carries no immediate line");
+    std::fs::write(&path, replaced).expect("rewrite config");
+    path
+}
+
 struct Bridge {
     child: Child,
     stdin: ChildStdin,
@@ -313,6 +328,54 @@ fn document_symbols_flattened_sorted_with_containers() {
     assert_eq!(names, vec!["aaa_first", "outer_fn", "inner_value"]);
     assert_eq!(result["symbols"][2]["container"], "outer_fn");
     assert_eq!(result["uri"], "file:///main.rs");
+    bridge.shutdown();
+}
+
+#[test]
+fn send_root_path_opt_in_reaches_initialize() {
+    // Validation (the gdshader shape, SHADER-ADDENDUM item 4):
+    // an opted-in stanza's server receives the deprecated
+    // rootPath initialize param, carrying the workspace root as
+    // a filesystem path. The fake echoes what arrived as its
+    // one symbol name.
+    let dir = temp_dir("rootpath-on");
+    let ws = make_workspace(&dir);
+    let config = write_fake_config_root_path(&dir, "rootpath");
+    let mut bridge = Bridge::spawn(&config);
+    let (is_error, result) = bridge.call_tool(
+        "document_symbols",
+        serde_json::json!({
+            "workspace": ws.to_string_lossy(), "server": "fake", "path": "main.rs"
+        }),
+    );
+    assert!(!is_error, "{result}");
+    assert_eq!(result["count"], 1, "{result}");
+    assert_eq!(
+        result["symbols"][0]["name"],
+        serde_json::json!(ws.to_string_lossy().into_owned()),
+        "{result}"
+    );
+    bridge.shutdown();
+}
+
+#[test]
+fn send_root_path_absent_by_default() {
+    // Adversarial: without the opt-in the bridge sends the
+    // modern initialize shape only — no rootPath reaches the
+    // server, so the echo is the absent marker, never a path.
+    let dir = temp_dir("rootpath-off");
+    let ws = make_workspace(&dir);
+    let config = write_fake_config(&dir, "rootpath", "", &[]);
+    let mut bridge = Bridge::spawn(&config);
+    let (is_error, result) = bridge.call_tool(
+        "document_symbols",
+        serde_json::json!({
+            "workspace": ws.to_string_lossy(), "server": "fake", "path": "main.rs"
+        }),
+    );
+    assert!(!is_error, "{result}");
+    assert_eq!(result["count"], 1, "{result}");
+    assert_eq!(result["symbols"][0]["name"], "rootpath-absent", "{result}");
     bridge.shutdown();
 }
 
