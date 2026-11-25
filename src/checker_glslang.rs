@@ -413,8 +413,24 @@ fn parse_aggregate(rest: &str) -> Option<u64> {
     digits.parse().ok()
 }
 
+/// Stage display names as glslang spells them in link lines —
+/// NOT the `-S` tokens of [`ADMITTED_STAGES`]: the captured
+/// evidence (design Appendix A.3) reads `Linking fragment stage:`,
+/// and glslang's own test goldens use these six names. A link
+/// line naming anything else is not silently reinterpreted; it
+/// falls through and invalidates the run like any unparseable
+/// line.
+const LINK_STAGE_DISPLAY_NAMES: [&str; 6] = [
+    "vertex",
+    "tessellation control",
+    "tessellation evaluation",
+    "geometry",
+    "fragment",
+    "compute",
+];
+
 /// Whether `rest` is a link line: `Linking <stage> stage: <text>`
-/// with a stage from glslang's own list.
+/// with one of glslang's stage display names.
 fn is_link_line(rest: &str) -> bool {
     let Some(after) = rest.strip_prefix("Linking ") else {
         return false;
@@ -422,7 +438,7 @@ fn is_link_line(rest: &str) -> bool {
     let Some((stage, _)) = after.split_once(" stage: ") else {
         return false;
     };
-    ADMITTED_STAGES.contains(&stage)
+    LINK_STAGE_DISPLAY_NAMES.contains(&stage)
 }
 
 /// Match a positioned diagnostic body against the known source
