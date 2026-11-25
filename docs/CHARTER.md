@@ -81,6 +81,39 @@ Sessions key on `(workspace, server)`, at most 4. A dead session
 is never silently respawned; `session_restart` is the only
 respawn path.
 
+## Checkers
+
+A `[[checker]]` entry pins a one-shot command-line tool — not a
+language server — that the bridge runs per document when a caller
+names its id in a `diagnostics` call: the document's exact bytes
+go to the tool on stdin, and its output is parsed through a
+named, versioned parser profile (v1 ships one:
+`glslang-validator-1`, for glslangValidator). Checkers keep no
+session; `session_status` for a checker id returns the run-record
+family (what ran, with which input hash, exit code, and tool
+version), never a fabricated LSP transcript. Every other tool
+refuses a checker id.
+
+Two authorities exist, and the stanza must name one:
+
+- **cross-check** — an independent second opinion beside the
+  owning language server (glslangValidator beside glsld, in the
+  shipped example). It runs only when explicitly named, returns
+  its own labelled set, and is never merged with the owner's.
+  Where the two disagree on a file's pass/fail verdict, that is a
+  conformance incident — evidence about one of the two tools —
+  to investigate, not a tie to break by preference.
+- **owner** — the checker is the diagnostics route for its
+  extensions, for stages or languages no language server covers.
+  Config load refuses an owner checker over any extension a
+  diagnostics-owner server claims, so the question "whose
+  diagnostics gate this file?" always has exactly one answer,
+  settled before the bridge starts.
+
+Routing is unchanged by checkers: extension-based routing
+considers `[[server]]` entries only. A checker answers only the
+caller who names it.
+
 ## Mutation posture
 
 The read class is the default surface. Two apply tools exist —
