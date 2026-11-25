@@ -750,14 +750,22 @@ fn validate_checker(raw: &RawChecker) -> BridgeResult<CheckerEntry> {
     // Placeholder discipline: whole-element substitution only, no
     // unknown placeholders, and the per-run temp placeholders at
     // most once each (two runs' outputs must never share a path
-    // inside one invocation).
+    // inside one invocation). One profile exception, driven by
+    // the tool's own argv grammar: glslangValidator rejects a
+    // split `-I` (`-I<dir>` must be one element — its own error
+    // text says so), so the glslang profile admits exactly the
+    // two glued include forms. The substituted value still lands
+    // as exactly one argv element; the discipline's purpose —
+    // no value is ever split or smeared across elements — holds.
     let mut seen_output = false;
     let mut seen_depfile = false;
     for element in &raw.command {
         if !element.contains('{') && !element.contains('}') {
             continue;
         }
-        if !CHECKER_PLACEHOLDERS.contains(&element.as_str()) {
+        let glued_include = parser == CheckerParser::GlslangValidator1
+            && (element == "-I{file_dir}" || element == "-I{project_root}");
+        if !glued_include && !CHECKER_PLACEHOLDERS.contains(&element.as_str()) {
             return Err(invalid(format!(
                 "checker {:?}: command element {element:?} is not a whole-element known \
                  placeholder (one of {})",

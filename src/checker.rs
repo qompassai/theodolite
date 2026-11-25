@@ -537,10 +537,14 @@ impl CheckerManager {
         };
         // Per-run temp paths for the tool's declared outputs; the
         // directory is deleted when the run record is built
-        // (design §3.4).
+        // (design §3.4). The counter keeps directories unique
+        // across managers sharing one process (run ids restart
+        // per manager; pids do not distinguish them).
+        static RUN_DIR_COUNTER: AtomicU64 = AtomicU64::new(0);
         let temp_dir = std::env::temp_dir().join(format!(
-            "theodolite-checker-run-{}-{run_id}",
-            std::process::id()
+            "theodolite-checker-run-{}-{run_id}-{}",
+            std::process::id(),
+            RUN_DIR_COUNTER.fetch_add(1, Ordering::SeqCst)
         ));
         let _ = std::fs::remove_dir_all(&temp_dir);
         std::fs::create_dir_all(&temp_dir)
@@ -579,6 +583,12 @@ impl CheckerManager {
                 "{project_root}" => project_root.to_string_lossy().into_owned(),
                 "{output}" => output_path.to_string_lossy().into_owned(),
                 "{depfile}" => depfile_path.to_string_lossy().into_owned(),
+                // The glslang profile's glued include forms: the
+                // flag and the directory stay one argv element.
+                "-I{file_dir}" => format!("-I{file_dir}"),
+                "-I{project_root}" => {
+                    format!("-I{}", project_root.to_string_lossy())
+                }
                 other => other.to_string(),
             }
         };
@@ -753,10 +763,41 @@ impl CheckerManager {
                         dependencies_complete = false;
                     }
                 }
-                known_sources.push(checker_glslang::known_source(&canonical, dep_bytes));
+                // The parser matches the token as printed; the
+                // URI and the cache key use the canonical path.
+                known_sources.push(KnownSource {
+                    token: dep.to_string_lossy().into_owned(),
+                    uri: path_to_uri(&canonical),
+                    bytes: dep_bytes,
+                });
             }
         } else {
             dependencies_complete = false;
+        }
+
+        // Complete the source set from the log's own tokens:
+        // glslang writes no depfile on a failed compile, so an
+        // included file carrying a diagnostic is named only here
+        // (see checker_glslang::output_named_sources). Candidates
+        // must canonicalize inside the workspace and be readable;
+        // anything else stays unknown and the parser invalidates
+        // the run, per the escape discipline.
+        for named in checker_glslang::output_named_sources(&stderr) {
+            if known_sources.iter().any(|s| s.token == named.to_string_lossy()) {
+                continue;
+            }
+            let Ok(canonical) = std::fs::canonicalize(&named) else {
+                continue;
+            };
+            if !canonical.starts_with(workspace) {
+                continue;
+            }
+            let bytes = read_bounded(&canonical, entry.max_input_bytes);
+            known_sources.push(KnownSource {
+                token: named.to_string_lossy().into_owned(),
+                uri: path_to_uri(&canonical),
+                bytes,
+            });
         }
 
         let diagnostics = match checker_glslang::parse_run(&ParseInput {

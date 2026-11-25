@@ -83,6 +83,30 @@ pub fn validate_config(entry: &CheckerEntry) -> BridgeResult<()> {
             )));
         }
     }
+    // The include search path (design §2.3) reaches the tool only
+    // through argv, and this glslang build takes `-I<dir>` glued
+    // only — a split `-I` is a runtime command-line failure (exit
+    // 1), so the profile refuses it at load and requires the two
+    // glued forms, the file's own directory before the project
+    // root.
+    if entry.command.iter().any(|e| e == "-I") {
+        return Err(invalid(format!(
+            "checker {:?}: a split \"-I\" element is refused; glslangValidator requires \
+             the glued forms \"-I{{file_dir}}\" and \"-I{{project_root}}\"",
+            entry.id
+        )));
+    }
+    let position = |needle: &str| entry.command.iter().position(|e| e == needle);
+    match (position("-I{file_dir}"), position("-I{project_root}")) {
+        (Some(dir), Some(root)) if dir < root => {}
+        _ => {
+            return Err(invalid(format!(
+                "checker {:?}: the glslang profile requires \"-I{{file_dir}}\" before \
+                 \"-I{{project_root}}\" in command (design §2.3 include order)",
+                entry.id
+            )));
+        }
+    }
     for (extension, stage) in &entry.stage_by_extension {
         if !ADMITTED_STAGES.contains(&stage.as_str()) {
             return Err(invalid(format!(
@@ -559,6 +583,66 @@ pub fn known_source(path: &Path, bytes: Option<Vec<u8>>) -> KnownSource {
         uri: path_to_uri(path),
         bytes,
     }
+}
+
+/// Absolute paths the info log itself names as positioned
+/// diagnostic sources. This exists because of a measured tool
+/// behaviour (primo, 2026-11-24): glslang writes NO depfile on a
+/// failed compile, so for exactly the runs that carry diagnostics
+/// about included files, the depfile cannot name their sources —
+/// yet design §9.1.6 requires those diagnostics reported against
+/// the included file's URI. The runner completes the source set
+/// from the log's own tokens (each candidate still has to
+/// canonicalize inside the workspace and be readable before the
+/// parser will map against it); the depfile remains the cache's
+/// freshness evidence, and a run without one is never cached.
+/// Pure scan: for each `ERROR: `/`WARNING: ` line, the longest
+/// prefix that is an absolute path followed by `:<line>:<col>: `.
+pub fn output_named_sources(stderr: &str) -> Vec<PathBuf> {
+    let mut found: Vec<PathBuf> = Vec::new();
+    for line in stderr.lines() {
+        let Some(rest) = line
+            .strip_prefix("ERROR: ")
+            .or_else(|| line.strip_prefix("WARNING: "))
+        else {
+            continue;
+        };
+        let bytes = rest.as_bytes();
+        let mut best: Option<&str> = None;
+        for i in 0..bytes.len() {
+            if bytes[i] != b':' {
+                continue;
+            }
+            // Parse ":<line>:<column>: " starting at i.
+            let mut j = i + 1;
+            let digits = |j: &mut usize| {
+                let start = *j;
+                while *j < bytes.len() && bytes[*j].is_ascii_digit() {
+                    *j += 1;
+                }
+                *j > start
+            };
+            if !digits(&mut j) || j >= bytes.len() || bytes[j] != b':' {
+                continue;
+            }
+            j += 1;
+            if !digits(&mut j) || j + 1 >= bytes.len() || bytes[j] != b':' || bytes[j + 1] != b' '
+            {
+                continue;
+            }
+            let token = &rest[..i];
+            if token.starts_with('/') && best.is_none_or(|b| token.len() > b.len()) {
+                best = Some(token);
+            }
+        }
+        if let Some(token) = best {
+            let path = PathBuf::from(token);
+            if !found.contains(&path) {
+                found.push(path);
+            }
+        }
+    }
+    found
 }
 
 /// Stage map lookup used by tests and the runner alike: the
