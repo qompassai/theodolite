@@ -61,6 +61,10 @@ pub enum DiagnosticChannel {
     Pull,
     /// Reported identically over both channels.
     PushAndPull,
+    /// Produced by a checker's one-shot run (checker design
+    /// §3.5): never an LSP channel, and never merged with one
+    /// in v1.
+    Checker,
 }
 
 impl DiagnosticChannel {
@@ -70,13 +74,19 @@ impl DiagnosticChannel {
             DiagnosticChannel::Push => "push",
             DiagnosticChannel::Pull => "pull",
             DiagnosticChannel::PushAndPull => "push+pull",
+            DiagnosticChannel::Checker => "checker",
         }
     }
 
     /// Combine two provenances for the same diagnostic identity.
+    /// Checker entries never merge in v1 (checker design §10.4);
+    /// the checker arm is defensive only — the merge path is fed
+    /// server sets exclusively.
     pub fn combine(self, other: DiagnosticChannel) -> DiagnosticChannel {
         if self == other {
             self
+        } else if self == DiagnosticChannel::Checker || other == DiagnosticChannel::Checker {
+            DiagnosticChannel::Checker
         } else {
             DiagnosticChannel::PushAndPull
         }
