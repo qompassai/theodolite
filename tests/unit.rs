@@ -569,7 +569,9 @@ fn supervisor_stat_parse_reads_pgrp_and_starttime() {
 
 // --- Checker stanzas: config validation (design §9.1.1, §9.2.8) ---
 
-use theodolite::checker_glslang::{ParseInput, derive_stage, parse_depfile, parse_run};
+use theodolite::checker_glslang::{
+    ParseInput, derive_stage, output_named_sources, parse_depfile, parse_run,
+};
 
 /// A GLSL-owning server stanza (glsld's shape): the diagnostics
 /// owner for the GLSL extensions, against which checker ownership
@@ -603,7 +605,7 @@ stage_by_extension = { frag = "frag", vert = "vert", geom = "geom", comp = "comp
 authority = "cross-check"
 trigger = "on-sync"
 root_markers = [".git", "shaders.toml"]
-command = ["/bin/true", "-V", "--target-env", "vulkan1.3", "--error-column", "--stdin", "-S", "{stage}", "-I", "{file_dir}", "-I", "{project_root}", "--depfile", "{depfile}", "-o", "{output}"]
+command = ["/bin/true", "-V", "--target-env", "vulkan1.3", "--error-column", "--stdin", "-S", "{stage}", "-I{file_dir}", "-I{project_root}", "--depfile", "{depfile}", "-o", "{output}"]
 env = { PATH = "/usr/local/bin:/usr/bin:/bin" }
 "#;
 
@@ -667,7 +669,7 @@ stage_by_extension = { mesh = "mesh" }
 authority = "owner"
 trigger = "on-sync"
 root_markers = [".git"]
-command = ["/bin/true", "-V", "--error-column", "--stdin", "-S", "{stage}", "--depfile", "{depfile}", "-o", "{output}"]
+command = ["/bin/true", "-V", "--error-column", "--stdin", "-S", "{stage}", "-I{file_dir}", "-I{project_root}", "--depfile", "{depfile}", "-o", "{output}"]
 "#;
     let body = format!("{GLSLD_SERVER}{owner}");
     let config = load_config("cfg-checker-owner-free", &body).expect("owner on free extension");
@@ -775,6 +777,14 @@ fn checker_command_contract_violations_are_rejected() {
         VALID_CHECKER.replace(", tese = \"tese\" }", " }")
     );
     assert_config_invalid("cfg-checker-cmd-nostage", &no_stage);
+    // A split `-I` is refused at load: this glslang build takes
+    // the include directory glued only, and a split form would
+    // otherwise fail every run with a command-line error.
+    let split_include = format!(
+        "{GLSLD_SERVER}{}",
+        VALID_CHECKER.replace("\"-I{file_dir}\"", "\"-I\", \"{file_dir}\"")
+    );
+    assert_config_invalid("cfg-checker-cmd-spliti", &split_include);
 }
 
 #[test]
@@ -1037,6 +1047,22 @@ fn stage_derivation_compound_suffix_map_and_refusal() {
         derive_stage(entry, Path::new("/ws/x.glsl")),
         Err(BridgeError::CheckerStageUnknown { .. })
     ));
+}
+
+#[test]
+fn output_named_sources_finds_absolute_positioned_tokens() {
+    // The failed-include shape measured on primo: no depfile is
+    // written, and the header is named only in the log itself.
+    let stderr = concat!(
+        "stdin\n",
+        "ERROR: /ws/inc/common.glsl:1:35: 'nope_undeclared' : undeclared identifier", " ", "\n",
+        "ERROR: stdin:4:6: '' : compilation terminated", " ", "\n",
+    );
+    assert_eq!(
+        output_named_sources(stderr),
+        vec![PathBuf::from("/ws/inc/common.glsl")]
+    );
+    assert!(output_named_sources("stdin\n").is_empty());
 }
 
 #[test]
