@@ -588,8 +588,8 @@ fn tool_checker_diagnostics(
     let absolute = resolve_within(&workspace, raw_path)?;
     // Refuse oversize input before reading it whole, and again on
     // the bytes actually read (the file may have grown between).
-    let metadata = std::fs::metadata(&absolute)
-        .map_err(|e| io_error("statting the checker target", e))?;
+    let metadata =
+        std::fs::metadata(&absolute).map_err(|e| io_error("statting the checker target", e))?;
     if metadata.len() > entry.max_input_bytes {
         return Err(BridgeError::CheckerInputTooLarge {
             checker: entry.id.clone(),
@@ -597,8 +597,7 @@ fn tool_checker_diagnostics(
             limit: entry.max_input_bytes,
         });
     }
-    let bytes =
-        std::fs::read(&absolute).map_err(|e| io_error("reading the checker target", e))?;
+    let bytes = std::fs::read(&absolute).map_err(|e| io_error("reading the checker target", e))?;
     if bytes.len() as u64 > entry.max_input_bytes {
         return Err(BridgeError::CheckerInputTooLarge {
             checker: entry.id.clone(),
@@ -612,10 +611,9 @@ fn tool_checker_diagnostics(
             detail: format!("{} is not valid UTF-8", absolute.display()),
         });
     }
-    let (diagnostics, record) =
-        manager
-            .checkers()
-            .diagnostics(entry, &workspace, &absolute, &bytes)?;
+    let (diagnostics, record) = manager
+        .checkers()
+        .diagnostics(entry, &workspace, &absolute, &bytes)?;
     let mut shaped: Vec<Diagnostic> = Vec::with_capacity(diagnostics.len());
     for mut diagnostic in diagnostics {
         diagnostic.uri = relativize_uri(&diagnostic.uri, &workspace)?;
@@ -639,9 +637,7 @@ fn tool_checker_diagnostics(
                 .config()
                 .servers
                 .iter()
-                .find(|server| {
-                    server.diagnostics_owner && server.extensions.iter().any(|e| *e == extension)
-                })
+                .find(|server| server.diagnostics_owner && server.extensions.contains(&extension))
                 .map(|server| server.id.clone())
                 .unwrap_or_else(|| entry.id.clone())
         }

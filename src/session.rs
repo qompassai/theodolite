@@ -1599,9 +1599,9 @@ pub(crate) fn run_version_probe(
     let mut output = Vec::new();
     if let Some(mut stdout) = child.stdout.take() {
         let mut limited = Read::take(&mut stdout, (VERSION_PROBE_MAX_BYTES + 1) as u64);
-        limited.read_to_end(&mut output).map_err(|e| {
-            VersionProbeFailure::Io(format!("reading version probe output: {e}"))
-        })?;
+        limited
+            .read_to_end(&mut output)
+            .map_err(|e| VersionProbeFailure::Io(format!("reading version probe output: {e}")))?;
     }
     if output.len() > VERSION_PROBE_MAX_BYTES {
         return Err(VersionProbeFailure::OutputTooLarge);

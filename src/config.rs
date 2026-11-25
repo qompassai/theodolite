@@ -253,9 +253,7 @@ impl CheckerTrigger {
         match raw {
             "on-sync" => Ok(CheckerTrigger::OnSync),
             other => Err(BridgeError::ConfigInvalid {
-                detail: format!(
-                    "unknown checker trigger {other:?}; v1 admits exactly \"on-sync\""
-                ),
+                detail: format!("unknown checker trigger {other:?}; v1 admits exactly \"on-sync\""),
             }),
         }
     }

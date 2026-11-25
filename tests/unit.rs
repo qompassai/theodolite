@@ -635,10 +635,7 @@ fn checker_crosscheck_stanza_loads_and_server_routing_is_unchanged() {
     // Extension routing still considers servers only (§4.1): the
     // checker is reachable solely by explicit id.
     assert_eq!(
-        config
-            .server_for_extension("frag")
-            .expect("frag routes")
-            .id,
+        config.server_for_extension("frag").expect("frag routes").id,
         "glsld"
     );
     assert!(config.server_by_id("glslang-vulkan-crosscheck").is_none());
@@ -820,7 +817,10 @@ fn checker_bound_and_marker_violations_are_rejected() {
         ),
         (
             "markers-empty".to_string(),
-            VALID_CHECKER.replace("root_markers = [\".git\", \"shaders.toml\"]", "root_markers = []"),
+            VALID_CHECKER.replace(
+                "root_markers = [\".git\", \"shaders.toml\"]",
+                "root_markers = []",
+            ),
         ),
         (
             "markers-escape".to_string(),
@@ -853,14 +853,7 @@ fn deployed_bridge_toml_shape_loads() {
         .server_by_id("gdshader-lsp")
         .expect("gdshader stanza present");
     assert!(gdshader.send_root_path);
-    assert!(
-        config
-            .servers
-            .iter()
-            .filter(|s| s.send_root_path)
-            .count()
-            == 1
-    );
+    assert!(config.servers.iter().filter(|s| s.send_root_path).count() == 1);
 }
 
 // --- Checker parser goldens (design §9.1.2/9.1.4, §9.2.4, §9.2.6) ---
@@ -876,8 +869,12 @@ const NOMAIN_FRAG: &[u8] = include_bytes!("fixtures/checker/no-main.frag");
 fn bad_stderr() -> String {
     concat!(
         "stdin\n",
-        "ERROR: stdin:7:28: 'missing_alpha' : undeclared identifier", " ", "\n",
-        "ERROR: stdin:7:41: '' : compilation terminated", " ", "\n",
+        "ERROR: stdin:7:28: 'missing_alpha' : undeclared identifier",
+        " ",
+        "\n",
+        "ERROR: stdin:7:41: '' : compilation terminated",
+        " ",
+        "\n",
         "ERROR: 2 compilation errors.  No code generated.\n",
     )
     .to_string()
@@ -961,8 +958,12 @@ fn parser_unicode_columns_convert_bytes_to_utf16() {
     // UTF-16 units) put the UTF-16 column at 31.
     let stderr = concat!(
         "stdin\n",
-        "ERROR: stdin:4:35: 'missing_value' : undeclared identifier", " ", "\n",
-        "ERROR: stdin:4:48: '' : compilation terminated", " ", "\n",
+        "ERROR: stdin:4:35: 'missing_value' : undeclared identifier",
+        " ",
+        "\n",
+        "ERROR: stdin:4:48: '' : compilation terminated",
+        " ",
+        "\n",
         "ERROR: 2 compilation errors.  No code generated.\n",
     );
     let diagnostics = parse(UNICODE_FRAG, 2, stderr).expect("unicode parse");
@@ -989,7 +990,9 @@ fn parser_malformed_output_family_is_invalid() {
     // A positioned line without a column.
     let no_column = concat!(
         "stdin\n",
-        "ERROR: stdin:7: 'missing_alpha' : undeclared identifier", " ", "\n",
+        "ERROR: stdin:7: 'missing_alpha' : undeclared identifier",
+        " ",
+        "\n",
         "ERROR: 2 compilation errors.  No code generated.\n",
     );
     assert!(matches!(
@@ -1055,8 +1058,12 @@ fn output_named_sources_finds_absolute_positioned_tokens() {
     // written, and the header is named only in the log itself.
     let stderr = concat!(
         "stdin\n",
-        "ERROR: /ws/inc/common.glsl:1:35: 'nope_undeclared' : undeclared identifier", " ", "\n",
-        "ERROR: stdin:4:6: '' : compilation terminated", " ", "\n",
+        "ERROR: /ws/inc/common.glsl:1:35: 'nope_undeclared' : undeclared identifier",
+        " ",
+        "\n",
+        "ERROR: stdin:4:6: '' : compilation terminated",
+        " ",
+        "\n",
     );
     assert_eq!(
         output_named_sources(stderr),
@@ -1070,6 +1077,9 @@ fn depfile_parsing_drops_stdin_and_keeps_absolute_paths() {
     let deps = parse_depfile("/tmp/out.spv: stdin /ws/inc/common.glsl /ws/inc/other.glsl\n");
     assert_eq!(
         deps,
-        vec![PathBuf::from("/ws/inc/common.glsl"), PathBuf::from("/ws/inc/other.glsl")]
+        vec![
+            PathBuf::from("/ws/inc/common.glsl"),
+            PathBuf::from("/ws/inc/other.glsl")
+        ]
     );
 }

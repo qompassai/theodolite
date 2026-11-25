@@ -58,7 +58,13 @@ const REFUSED_FLAGS: [&str; 9] = [
 pub fn validate_config(entry: &CheckerEntry) -> BridgeResult<()> {
     let invalid = |detail: String| BridgeError::ConfigInvalid { detail };
     debug_assert_eq!(entry.parser, CheckerParser::GlslangValidator1);
-    let count = |needle: &str| entry.command.iter().filter(|e| e.as_str() == needle).count();
+    let count = |needle: &str| {
+        entry
+            .command
+            .iter()
+            .filter(|e| e.as_str() == needle)
+            .count()
+    };
     if count("{stage}") != 1 {
         return Err(invalid(format!(
             "checker {:?}: the glslang profile requires exactly one {{stage}} in command",
@@ -298,7 +304,9 @@ pub fn parse_run(input: &ParseInput) -> BridgeResult<Vec<Diagnostic>> {
             && let Some(count) = parse_aggregate(rest)
         {
             if aggregate.is_some() {
-                return Err(invalid("duplicate aggregate line in the info log".to_string()));
+                return Err(invalid(
+                    "duplicate aggregate line in the info log".to_string(),
+                ));
             }
             aggregate = Some(count);
             continue;
@@ -469,10 +477,7 @@ fn is_link_line(rest: &str) -> bool {
 /// tokens (longest first): `<token>:<line>:<column>: <message>`.
 /// Returns the token, the 1-based line and byte column, and the
 /// verbatim message.
-fn match_positioned<'a>(
-    rest: &'a str,
-    tokens: &[&'a str],
-) -> Option<(&'a str, u64, u64, &'a str)> {
+fn match_positioned<'a>(rest: &'a str, tokens: &[&'a str]) -> Option<(&'a str, u64, u64, &'a str)> {
     for token in tokens {
         let Some(after) = rest.strip_prefix(token) else {
             continue;
@@ -626,8 +631,7 @@ pub fn output_named_sources(stderr: &str) -> Vec<PathBuf> {
                 continue;
             }
             j += 1;
-            if !digits(&mut j) || j + 1 >= bytes.len() || bytes[j] != b':' || bytes[j + 1] != b' '
-            {
+            if !digits(&mut j) || j + 1 >= bytes.len() || bytes[j] != b':' || bytes[j + 1] != b' ' {
                 continue;
             }
             let token = &rest[..i];

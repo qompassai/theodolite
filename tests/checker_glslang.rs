@@ -30,10 +30,7 @@ GL_KHR_vulkan_glsl version 100
 ARB_GL_gl_spirv version 100";
 
 fn temp_dir(tag: &str) -> PathBuf {
-    let dir = std::env::temp_dir().join(format!(
-        "theodolite-checker-{tag}-{}",
-        std::process::id()
-    ));
+    let dir = std::env::temp_dir().join(format!("theodolite-checker-{tag}-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).expect("create temp dir");
     dir.canonicalize().expect("canonical temp dir")
@@ -44,8 +41,7 @@ fn write_script(dir: &Path, name: &str, body: &str) -> PathBuf {
     let mut file = std::fs::File::create(&path).expect("create script");
     file.write_all(body.as_bytes()).expect("write script");
     drop(file);
-    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755))
-        .expect("chmod script");
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).expect("chmod script");
     path
 }
 
@@ -141,7 +137,10 @@ fn fake_ok_run_completes_and_second_call_is_cached() {
     assert_eq!(record.state, "completed");
     assert_eq!(record.exit_code, Some(0));
     let (_, record2) = run(&manager, &entry, &ws, &target, &bytes).expect("cached call");
-    assert_eq!(record2.run_id, record.run_id, "second call served the same run");
+    assert_eq!(
+        record2.run_id, record.run_id,
+        "second call served the same run"
+    );
     let runs = std::fs::read_to_string(&counter).unwrap();
     assert_eq!(runs.lines().count(), 1, "the tool ran exactly once");
     // A changed document runs again.

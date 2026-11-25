@@ -186,10 +186,7 @@ impl RunSlots {
                 *guard += 1;
                 return true;
             }
-            let (next, _) = self
-                .freed
-                .wait_timeout(guard, POLL)
-                .unwrap();
+            let (next, _) = self.freed.wait_timeout(guard, POLL).unwrap();
             guard = next;
         }
     }
@@ -232,13 +229,12 @@ impl CheckerManager {
     /// The status transcript for one checker in one workspace:
     /// the pinned tool version (once probed) and the last run
     /// record per document.
-    pub fn status_snapshot(&self, checker_id: &str, workspace: &Path) -> (Option<String>, Vec<RunRecord>) {
-        let version = self
-            .versions
-            .lock()
-            .unwrap()
-            .get(checker_id)
-            .cloned();
+    pub fn status_snapshot(
+        &self,
+        checker_id: &str,
+        workspace: &Path,
+    ) -> (Option<String>, Vec<RunRecord>) {
+        let version = self.versions.lock().unwrap().get(checker_id).cloned();
         let mut runs: Vec<RunRecord> = self
             .records
             .lock()
@@ -263,9 +259,7 @@ impl CheckerManager {
         let actual = run_version_probe(&entry.binary, &entry.version_probe).map_err(|failure| {
             let detail = match failure {
                 VersionProbeFailure::Io(detail) => detail,
-                VersionProbeFailure::Timeout => {
-                    "version probe exceeded its deadline".to_string()
-                }
+                VersionProbeFailure::Timeout => "version probe exceeded its deadline".to_string(),
                 VersionProbeFailure::NonZeroExit(status) => {
                     format!("version probe exited with {status}")
                 }
@@ -326,7 +320,7 @@ impl CheckerManager {
         };
         loop {
             enum Step {
-                Serve(CompletedRun),
+                Serve(Box<CompletedRun>),
                 Follow(Arc<ActiveRun>),
                 Supersede(Arc<ActiveRun>),
                 Debounce,
@@ -342,7 +336,7 @@ impl CheckerManager {
                     && completed.key.project_root == project_root
                     && completed.key.dependencies_complete
                 {
-                    Step::Serve(completed.clone())
+                    Step::Serve(Box::new(completed.clone()))
                 } else if let Some(active) = state.active.clone() {
                     if active.hash == input_sha256 {
                         Step::Follow(active)
@@ -422,16 +416,20 @@ impl CheckerManager {
                 }
                 Step::Lead(active) => {
                     let outcome = self.execute(
-                        entry, workspace, target, bytes, &stage, &project_root, &version, &active,
+                        entry,
+                        workspace,
+                        target,
+                        bytes,
+                        &stage,
+                        &project_root,
+                        &version,
+                        &active,
                     );
                     let record = match &outcome {
                         Ok(completed) => completed.record.clone(),
                         Err(error) => self.failure_record(error, &input_sha256, &version),
                     };
-                    self.records
-                        .lock()
-                        .unwrap()
-                        .insert(key.clone(), record);
+                    self.records.lock().unwrap().insert(key.clone(), record);
                     {
                         let mut state = doc.lock().unwrap();
                         if let Ok(completed) = &outcome {
@@ -455,12 +453,7 @@ impl CheckerManager {
 
     /// A run record for a failed run, so `session_status` shows
     /// the failure honestly instead of the last success.
-    fn failure_record(
-        &self,
-        error: &BridgeError,
-        input_sha256: &str,
-        version: &str,
-    ) -> RunRecord {
+    fn failure_record(&self, error: &BridgeError, input_sha256: &str, version: &str) -> RunRecord {
         let state = match error {
             BridgeError::CheckerTimeout { .. } => "timeout",
             BridgeError::CheckerSuperseded { .. } => "superseded",
@@ -783,7 +776,10 @@ impl CheckerManager {
         // anything else stays unknown and the parser invalidates
         // the run, per the escape discipline.
         for named in checker_glslang::output_named_sources(&stderr) {
-            if known_sources.iter().any(|s| s.token == named.to_string_lossy()) {
+            if known_sources
+                .iter()
+                .any(|s| s.token == named.to_string_lossy())
+            {
                 continue;
             }
             let Ok(canonical) = std::fs::canonicalize(&named) else {
@@ -906,9 +902,7 @@ fn drain_stream(
 fn read_bounded(path: &Path, max_bytes: u64) -> Option<Vec<u8>> {
     let file = std::fs::File::open(path).ok()?;
     let mut buffer = Vec::new();
-    file.take(max_bytes + 1)
-        .read_to_end(&mut buffer)
-        .ok()?;
+    file.take(max_bytes + 1).read_to_end(&mut buffer).ok()?;
     if buffer.len() as u64 > max_bytes {
         return None;
     }

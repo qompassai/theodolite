@@ -2256,3 +2256,77 @@ fn progress_churn_still_fails_quiescent_readiness() {
     assert_eq!(Bridge::error_code(&result), "ServerNotReady", "{result}");
     bridge.shutdown();
 }
+
+/// Checker end-to-end (checker design §10.2 rung 4): a checker id
+/// through the real MCP surface — diagnostics answers with the
+/// checker envelope, session_status reports the run-record
+/// family, and a non-diagnostics tool refuses the id with the
+/// typed UnsupportedMethod code.
+#[test]
+fn checker_id_end_to_end_over_mcp() {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = temp_dir("mcp-checker");
+    let script = dir.join("fake-checker.sh");
+    std::fs::write(
+        &script,
+        "#!/bin/sh\nif [ \"$1\" = \"--version\" ]; then echo \"fake-checker 1.0\"; exit 0; fi\n\
+         cat > /dev/null\n\
+         dep=\"\"; prev=\"\"; for a in \"$@\"; do if [ \"$prev\" = \"--depfile\" ]; then dep=\"$a\"; fi; prev=\"$a\"; done\n\
+         printf 'out: stdin\\n' > \"$dep\"\nexit 0\n",
+    )
+    .expect("write fake checker");
+    std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755))
+        .expect("chmod fake checker");
+    let ws = dir.join("ws");
+    std::fs::create_dir_all(&ws).expect("mkdir ws");
+    std::fs::write(ws.join("a.frag"), "void main() {}\n").expect("write shader");
+    let stanza = format!(
+        "\n[[checker]]\nid = \"fake-checker\"\nparser = \"glslang-validator-1\"\n\
+         binary = \"{script}\"\nversion_probe = [\"--version\"]\n\
+         expect_version = \"fake-checker 1.0\"\nlanguages = [\"glsl\"]\n\
+         extensions = [\"frag\", \"glsl\"]\n\
+         language_ids = {{ frag = \"glsl\", glsl = \"glsl\" }}\n\
+         stage_by_extension = {{ frag = \"frag\" }}\nauthority = \"cross-check\"\n\
+         trigger = \"on-sync\"\nroot_markers = [\".git\"]\n\
+         command = [\"{script}\", \"-V\", \"--error-column\", \"--stdin\", \"-S\", \"{{stage}}\", \
+         \"-I{{file_dir}}\", \"-I{{project_root}}\", \"--depfile\", \"{{depfile}}\", \"-o\", \"{{output}}\"]\n",
+        script = script.display()
+    );
+    let config = write_fake_config(&dir, "clean", &stanza, &[]);
+    let mut bridge = Bridge::spawn(&config);
+    let ws_str = ws.to_string_lossy().into_owned();
+
+    let (is_error, result) = bridge.call_tool(
+        "diagnostics",
+        serde_json::json!({"server": "fake-checker", "workspace": ws_str, "path": "a.frag"}),
+    );
+    assert!(!is_error, "checker diagnostics: {result}");
+    assert_eq!(result["channels"], serde_json::json!(["checker"]));
+    assert_eq!(result["authority"], "cross-check");
+    assert_eq!(result["count"], 0);
+    assert_eq!(result["checker_run"]["state"], "completed");
+    assert_eq!(result["checker_run"]["exit_code"], 0);
+
+    let (is_error, status) = bridge.call_tool(
+        "session_status",
+        serde_json::json!({"server": "fake-checker", "workspace": ws_str}),
+    );
+    assert!(!is_error, "checker session_status: {status}");
+    assert_eq!(status["kind"], "checker");
+    assert_eq!(status["checker"]["parser"], "glslang-validator-1");
+    assert_eq!(status["runs"].as_array().map(Vec::len), Some(1));
+
+    let (is_error, refused) = bridge.call_tool(
+        "hover",
+        serde_json::json!({
+            "server": "fake-checker",
+            "workspace": ws_str,
+            "path": "a.frag",
+            "line": 0,
+            "character": 0
+        }),
+    );
+    assert!(is_error, "hover with a checker id must fail: {refused}");
+    assert_eq!(Bridge::error_code(&refused), "UnsupportedMethod");
+    bridge.shutdown();
+}
