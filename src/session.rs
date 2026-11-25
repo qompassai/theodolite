@@ -408,6 +408,15 @@ impl Session {
             "clientInfo": {"name": "theodolite", "version": env!("CARGO_PKG_VERSION")},
             "trace": "off"
         });
+        if self.entry.send_root_path {
+            // Legacy-root opt-in (stanza `send_root_path`): the
+            // deprecated `rootPath` param, the filesystem path
+            // behind `rootUri`. Only opted-in stanzas send it;
+            // gdshader-lsp reads its project root from this
+            // field alone (SHADER-ADDENDUM item 4).
+            params["rootPath"] =
+                serde_json::json!(self.workspace_root.to_string_lossy().into_owned());
+        }
         if let Some(options) = &self.entry.initialization_options {
             params["initializationOptions"] = options.clone();
         }

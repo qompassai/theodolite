@@ -48,7 +48,11 @@
 //! for the marker's clearing gate), `bigsymbols` / `hugesymbols`
 //! (flat document-symbol outlines of 600 / 10 000 entries — the
 //! symbol-budget sizes for the B2 gates; the workspace-symbol
-//! queries `many` / `huge` answer the same two sizes). The
+//! queries `many` / `huge` answer the same two sizes),
+//! `rootpath` (records the initialize `rootPath` param and
+//! answers documentSymbol with one symbol naming what arrived
+//! — the value verbatim, or `rootpath-absent` when the field
+//! was not sent — for the legacy-root opt-in gates). The
 //! `rich` mode also serves rename:
 //! `prepareRename` (null at line 99 — not renameable) and `rename`
 //! with scripted edit sets keyed by the requested new name
@@ -92,6 +96,7 @@ fn main() {
 struct Fake {
     mode: String,
     root_uri: String,
+    root_path: Option<String>,
     opened_uri: Option<String>,
     diagnostics_sent: bool,
     symbol_requests: u32,
@@ -105,6 +110,7 @@ fn serve(mode: &str) {
     let mut fake = Fake {
         mode: mode.to_string(),
         root_uri: String::new(),
+        root_path: None,
         opened_uri: None,
         diagnostics_sent: false,
         symbol_requests: 0,
@@ -184,6 +190,30 @@ impl Fake {
                     "jsonrpc": "2.0", "id": id,
                     "error": {"code": -32803, "message": "still indexing"}
                 }),
+            );
+            return true;
+        }
+        if self.mode == "rootpath" && method == "textDocument/documentSymbol" {
+            // Echo what initialize carried: the received rootPath
+            // verbatim, or the absent marker. The bridge's
+            // document_symbols gate asserts on this one name.
+            let root = self.root_uri.clone();
+            let name = self
+                .root_path
+                .clone()
+                .unwrap_or_else(|| "rootpath-absent".to_string());
+            respond(
+                writer,
+                id,
+                serde_json::json!([{
+                    "name": name,
+                    "kind": 6,
+                    "location": {
+                        "uri": format!("{root}/main.rs"),
+                        "range": range(0, 0, 0, 7)
+                    },
+                    "containerName": "rootpath"
+                }]),
             );
             return true;
         }
@@ -277,6 +307,10 @@ impl Fake {
                     .and_then(serde_json::Value::as_str)
                     .unwrap_or_default()
                     .to_string();
+                self.root_path = params
+                    .get("rootPath")
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::to_string);
                 let capabilities = match self.mode.as_str() {
                     "pull" => serde_json::json!({
                         "diagnosticProvider": {
@@ -298,6 +332,9 @@ impl Fake {
                     "prequiescent" | "latequiescent" => serde_json::json!({
                         "documentSymbolProvider": true,
                         "hoverProvider": true
+                    }),
+                    "rootpath" => serde_json::json!({
+                        "documentSymbolProvider": true
                     }),
                     "hoveronly" => serde_json::json!({
                         "hoverProvider": true

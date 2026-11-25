@@ -114,6 +114,22 @@ fn config_no_publish_means_empty_loads_and_defaults_to_none() {
 }
 
 #[test]
+fn config_send_root_path_loads_and_defaults_to_false() {
+    let dir = temp_dir("cfg-rootpath");
+    // The key lands inside the server stanza (it is the file's
+    // last table), opting that one server in to the legacy
+    // rootPath initialize field.
+    let body = format!("{VALID_SERVER}send_root_path = true\n");
+    let config = Config::load(&write_config(&dir, &body)).expect("root-path opt-in loads");
+    assert!(config.servers[0].send_root_path);
+    // Absent the key the opt-in is off: the bridge sends the
+    // modern initialize shape only, never a deprecated field
+    // by default.
+    let config = Config::load(&write_config(&dir, VALID_SERVER)).expect("default loads");
+    assert!(!config.servers[0].send_root_path);
+}
+
+#[test]
 fn config_gated_with_allowlist_loads() {
     let dir = temp_dir("cfg-gated");
     let body =
@@ -341,6 +357,17 @@ fn config_no_publish_means_empty_out_of_bounds_is_refused() {
     // that silently does nothing is refused, not carried.
     let body = format!("ready_timeout_ms = 3000\n{VALID_SERVER}no_publish_means_empty_ms = 5000\n");
     let error = Config::load(&write_config(&dir, &body)).expect_err("window past deadline");
+    assert_eq!(error.code(), "ConfigInvalid");
+}
+
+#[test]
+fn config_send_root_path_non_bool_is_refused() {
+    let dir = temp_dir("cfg-rootpath-bad");
+    // A string is not a boolean opt-in: the parse refusal
+    // surfaces as the typed ConfigInvalid, never a silently
+    // defaulted false.
+    let body = format!("{VALID_SERVER}send_root_path = \"yes\"\n");
+    let error = Config::load(&write_config(&dir, &body)).expect_err("non-bool opt-in refused");
     assert_eq!(error.code(), "ConfigInvalid");
 }
 

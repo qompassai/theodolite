@@ -119,3 +119,27 @@ extensions = ["d", "di"]
 language_ids = { d = "d", di = "d" }
 readiness = "first-response"
 env = { PATH = "/usr/local/bin:/usr/bin:/bin" }
+
+# gdshader-lsp (Godot shaders): the server reads its project
+# root ONLY from the deprecated `rootPath` initialize field
+# (its main.rs) and loads its builtin functions only when a
+# root exists; without the field every builtin call
+# false-positives ("Function 'vec3' does not exist").
+# `send_root_path = true` opts this one stanza in to the
+# legacy field beside rootUri / workspaceFolders; every
+# stanza without the opt-in keeps the modern shape only.
+# The binary has no --version exit path (any invocation
+# starts the server), so on primo it is reached through a
+# wrapper that answers the probe from the install record.
+[[server]]
+id = "gdshader-lsp"
+binary = "/usr/local/bin/gdshader-lsp"
+version_probe = ["--version"]
+expect_version = "RECORD-ON-TARGET-MACHINE"
+languages = ["gdshader"]
+extensions = ["gdshader", "gdshaderinc"]
+language_ids = { gdshader = "gdshader", gdshaderinc = "gdshaderinc" }
+readiness = "immediate"
+diagnostics_owner = true
+send_root_path = true
+env = { PATH = "/usr/local/bin:/usr/bin:/bin" }

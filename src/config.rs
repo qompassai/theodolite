@@ -111,6 +111,18 @@ pub struct ServerEntry {
     /// evidence-only settle predicate: silence is a typed
     /// `ServerNotReady` at the ready deadline, never a zero.
     pub no_publish_means_empty_ms: Option<u64>,
+    /// Opt-in legacy root field: when true, the session's
+    /// `initialize` params also carry the deprecated `rootPath`
+    /// (the workspace root as a filesystem path) beside `rootUri`
+    /// / `workspaceFolders`. For servers that read their project
+    /// root from nowhere else: gdshader-lsp 0.1.0 sets its root
+    /// only from `rootPath` and loads its builtin functions only
+    /// when a root exists, so without the field every builtin
+    /// call false-positives (measured 2026-11-24; SHADER-
+    /// ADDENDUM item 4). `false` (the default) sends the modern
+    /// shape only — a deprecated field is never sent to a server
+    /// whose stanza did not opt in.
+    pub send_root_path: bool,
 }
 
 /// Mutation posture (SPEC §6): a configuration state, never a
@@ -191,6 +203,8 @@ struct RawServer {
     #[serde(default)]
     diagnostics_owner: bool,
     no_publish_means_empty_ms: Option<u64>,
+    #[serde(default)]
+    send_root_path: bool,
 }
 
 impl Config {
@@ -370,6 +384,7 @@ fn validate_server(raw: &RawServer) -> BridgeResult<ServerEntry> {
         settings: raw.settings.clone(),
         diagnostics_owner: raw.diagnostics_owner,
         no_publish_means_empty_ms: raw.no_publish_means_empty_ms,
+        send_root_path: raw.send_root_path,
     })
 }
 
