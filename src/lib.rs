@@ -15,6 +15,8 @@
 
 #![forbid(unsafe_code)]
 
+pub mod checker;
+pub mod checker_glslang;
 pub mod config;
 pub mod edits;
 pub mod errors;

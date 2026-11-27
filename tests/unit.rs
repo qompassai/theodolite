@@ -593,3 +593,520 @@ fn supervisor_stat_parse_reads_pgrp_and_starttime() {
         None
     );
 }
+
+// --- Checker stanzas: config validation (design §9.1.1, §9.2.8) ---
+
+use theodolite::checker_glslang::{
+    ParseInput, derive_stage, output_named_sources, parse_depfile, parse_run,
+};
+
+/// A GLSL-owning server stanza (glsld's shape): the diagnostics
+/// owner for the GLSL extensions, against which checker ownership
+/// is validated.
+const GLSLD_SERVER: &str = r#"
+[[server]]
+id = "glsld"
+binary = "/bin/true"
+version_probe = ["--version"]
+expect_version = "true 1.0"
+languages = ["glsl"]
+extensions = ["frag", "vert", "geom", "comp", "tesc", "tese", "glsl"]
+language_ids = { frag = "glsl", vert = "glsl", geom = "glsl", comp = "glsl", tesc = "glsl", tese = "glsl", glsl = "glsl" }
+readiness = "immediate"
+diagnostics_owner = true
+"#;
+
+/// The design §2.1 cross-check stanza, with /bin/true standing in
+/// for the tool binary (config load validates shape, not tools).
+const VALID_CHECKER: &str = r#"
+[[checker]]
+id = "glslang-vulkan-crosscheck"
+parser = "glslang-validator-1"
+binary = "/bin/true"
+version_probe = ["--version"]
+expect_version = "true 1.0"
+languages = ["glsl"]
+extensions = ["frag", "vert", "geom", "comp", "tesc", "tese", "glsl"]
+language_ids = { frag = "glsl", vert = "glsl", geom = "glsl", comp = "glsl", tesc = "glsl", tese = "glsl", glsl = "glsl" }
+stage_by_extension = { frag = "frag", vert = "vert", geom = "geom", comp = "comp", tesc = "tesc", tese = "tese" }
+authority = "cross-check"
+trigger = "on-sync"
+root_markers = [".git", "shaders.toml"]
+command = ["/bin/true", "-V", "--target-env", "vulkan1.3", "--error-column", "--stdin", "-S", "{stage}", "-I{file_dir}", "-I{project_root}", "--depfile", "{depfile}", "-o", "{output}"]
+env = { PATH = "/usr/local/bin:/usr/bin:/bin" }
+"#;
+
+fn load_config(tag: &str, body: &str) -> Result<Config, BridgeError> {
+    let dir = temp_dir(tag);
+    let path = write_config(&dir, body);
+    Config::load(&path)
+}
+
+fn assert_config_invalid(tag: &str, body: &str) {
+    match load_config(tag, body) {
+        Err(BridgeError::ConfigInvalid { .. }) => {}
+        Err(other) => panic!("{tag}: expected ConfigInvalid, got {other:?}"),
+        Ok(_) => panic!("{tag}: expected ConfigInvalid, config loaded"),
+    }
+}
+
+#[test]
+fn checker_crosscheck_stanza_loads_and_server_routing_is_unchanged() {
+    let body = format!("{GLSLD_SERVER}{VALID_CHECKER}");
+    let config = load_config("cfg-checker-ok", &body).expect("cross-check stanza loads");
+    assert_eq!(config.checkers.len(), 1);
+    let entry = config
+        .checker_by_id("glslang-vulkan-crosscheck")
+        .expect("checker resolves by id");
+    assert_eq!(entry.authority.as_str(), "cross-check");
+    // Extension routing still considers servers only (§4.1): the
+    // checker is reachable solely by explicit id.
+    assert_eq!(
+        config.server_for_extension("frag").expect("frag routes").id,
+        "glsld"
+    );
+    assert!(config.server_by_id("glslang-vulkan-crosscheck").is_none());
+}
+
+#[test]
+fn checker_owner_overlapping_an_lsp_owner_is_rejected() {
+    let body = format!(
+        "{GLSLD_SERVER}{}",
+        VALID_CHECKER.replace("cross-check", "owner")
+    );
+    assert_config_invalid("cfg-checker-owner-overlap", &body);
+}
+
+#[test]
+fn checker_owner_on_an_unclaimed_extension_loads() {
+    let owner = r#"
+[[checker]]
+id = "mesh-owner"
+parser = "glslang-validator-1"
+binary = "/bin/true"
+version_probe = ["--version"]
+expect_version = "true 1.0"
+languages = ["glsl"]
+extensions = ["mesh"]
+language_ids = { mesh = "glsl" }
+stage_by_extension = { mesh = "mesh" }
+authority = "owner"
+trigger = "on-sync"
+root_markers = [".git"]
+command = ["/bin/true", "-V", "--error-column", "--stdin", "-S", "{stage}", "-I{file_dir}", "-I{project_root}", "--depfile", "{depfile}", "-o", "{output}"]
+"#;
+    let body = format!("{GLSLD_SERVER}{owner}");
+    let config = load_config("cfg-checker-owner-free", &body).expect("owner on free extension");
+    assert_eq!(config.checkers.len(), 1);
+}
+
+#[test]
+fn checker_two_owners_on_one_extension_are_rejected() {
+    let one = VALID_CHECKER
+        .replace("glslang-vulkan-crosscheck", "owner-one")
+        .replace("cross-check", "owner")
+        .replace(
+            "extensions = [\"frag\", \"vert\", \"geom\", \"comp\", \"tesc\", \"tese\", \"glsl\"]",
+            "extensions = [\"mesh\"]",
+        )
+        .replace(
+            "language_ids = { frag = \"glsl\", vert = \"glsl\", geom = \"glsl\", comp = \"glsl\", tesc = \"glsl\", tese = \"glsl\", glsl = \"glsl\" }",
+            "language_ids = { mesh = \"glsl\" }",
+        )
+        .replace(
+            "stage_by_extension = { frag = \"frag\", vert = \"vert\", geom = \"geom\", comp = \"comp\", tesc = \"tesc\", tese = \"tese\" }",
+            "stage_by_extension = { mesh = \"mesh\" }",
+        );
+    let two = one.replace("owner-one", "owner-two");
+    let body = format!("{GLSLD_SERVER}{one}{two}");
+    assert_config_invalid("cfg-checker-two-owners", &body);
+}
+
+#[test]
+fn checker_id_colliding_with_a_server_id_is_rejected() {
+    let body = format!(
+        "{GLSLD_SERVER}{}",
+        VALID_CHECKER.replace("glslang-vulkan-crosscheck", "glsld")
+    );
+    assert_config_invalid("cfg-checker-id-collision", &body);
+}
+
+#[test]
+fn checker_missing_authority_is_rejected() {
+    let body = format!(
+        "{GLSLD_SERVER}{}",
+        VALID_CHECKER.replace("authority = \"cross-check\"\n", "")
+    );
+    assert_config_invalid("cfg-checker-no-authority", &body);
+}
+
+#[test]
+fn checker_unknown_parser_and_trigger_are_rejected() {
+    let bad_parser = format!(
+        "{GLSLD_SERVER}{}",
+        VALID_CHECKER.replace("glslang-validator-1", "regex-1")
+    );
+    assert_config_invalid("cfg-checker-bad-parser", &bad_parser);
+    let bad_trigger = format!(
+        "{GLSLD_SERVER}{}",
+        VALID_CHECKER.replace("on-sync", "on-save")
+    );
+    assert_config_invalid("cfg-checker-bad-trigger", &bad_trigger);
+}
+
+#[test]
+fn checker_command_contract_violations_are_rejected() {
+    // command[0] must be the probed binary.
+    let mismatch = format!(
+        "{GLSLD_SERVER}{}",
+        VALID_CHECKER.replace("command = [\"/bin/true\"", "command = [\"/bin/false\"")
+    );
+    assert_config_invalid("cfg-checker-cmd-mismatch", &mismatch);
+    // Placeholders substitute whole elements only.
+    let embedded = format!(
+        "{GLSLD_SERVER}{}",
+        VALID_CHECKER.replace("\"{stage}\"", "\"--stage={stage}\"")
+    );
+    assert_config_invalid("cfg-checker-cmd-embedded", &embedded);
+    // Unknown placeholders are refused.
+    let unknown = format!(
+        "{GLSLD_SERVER}{}",
+        VALID_CHECKER.replace("\"{stage}\"", "\"{bogus}\"")
+    );
+    assert_config_invalid("cfg-checker-cmd-unknown", &unknown);
+    // The glslang profile requires --error-column.
+    let no_column = format!(
+        "{GLSLD_SERVER}{}",
+        VALID_CHECKER.replace("\"--error-column\", ", "")
+    );
+    assert_config_invalid("cfg-checker-cmd-nocolumn", &no_column);
+    // Suppression flags are refused by the profile.
+    let quiet = format!(
+        "{GLSLD_SERVER}{}",
+        VALID_CHECKER.replace("\"-V\", ", "\"-V\", \"--quiet\", ")
+    );
+    assert_config_invalid("cfg-checker-cmd-quiet", &quiet);
+    // The per-run output placeholder appears at most once.
+    let dup_output = format!(
+        "{GLSLD_SERVER}{}",
+        VALID_CHECKER.replace(
+            "\"-o\", \"{output}\"",
+            "\"-o\", \"{output}\", \"-o\", \"{output}\""
+        )
+    );
+    assert_config_invalid("cfg-checker-cmd-dupout", &dup_output);
+    // Every claimed extension but bare glsl needs a stage.
+    let no_stage = format!(
+        "{GLSLD_SERVER}{}",
+        VALID_CHECKER.replace(", tese = \"tese\" }", " }")
+    );
+    assert_config_invalid("cfg-checker-cmd-nostage", &no_stage);
+    // A split `-I` is refused at load: this glslang build takes
+    // the include directory glued only, and a split form would
+    // otherwise fail every run with a command-line error.
+    let split_include = format!(
+        "{GLSLD_SERVER}{}",
+        VALID_CHECKER.replace("\"-I{file_dir}\"", "\"-I\", \"{file_dir}\"")
+    );
+    assert_config_invalid("cfg-checker-cmd-spliti", &split_include);
+}
+
+#[test]
+fn checker_bound_and_marker_violations_are_rejected() {
+    let cases: Vec<(String, String)> = vec![
+        (
+            "debounce".to_string(),
+            VALID_CHECKER.replace(
+                "trigger = \"on-sync\"",
+                "trigger = \"on-sync\"\ndebounce_ms = 5001",
+            ),
+        ),
+        (
+            "timeout".to_string(),
+            VALID_CHECKER.replace(
+                "trigger = \"on-sync\"",
+                "trigger = \"on-sync\"\ntimeout_ms = 99",
+            ),
+        ),
+        (
+            "input".to_string(),
+            VALID_CHECKER.replace(
+                "trigger = \"on-sync\"",
+                "trigger = \"on-sync\"\nmax_input_bytes = 65535",
+            ),
+        ),
+        (
+            "diagnostics".to_string(),
+            VALID_CHECKER.replace(
+                "trigger = \"on-sync\"",
+                "trigger = \"on-sync\"\nmax_diagnostics = 0",
+            ),
+        ),
+        (
+            "markers-empty".to_string(),
+            VALID_CHECKER.replace(
+                "root_markers = [\".git\", \"shaders.toml\"]",
+                "root_markers = []",
+            ),
+        ),
+        (
+            "markers-escape".to_string(),
+            VALID_CHECKER.replace(
+                "root_markers = [\".git\", \"shaders.toml\"]",
+                "root_markers = [\"../up\"]",
+            ),
+        ),
+        (
+            "binary-relative".to_string(),
+            VALID_CHECKER.replace("binary = \"/bin/true\"", "binary = \"bin/true\""),
+        ),
+    ];
+    for (tag, stanza) in cases {
+        let body = format!("{GLSLD_SERVER}{stanza}");
+        assert_config_invalid(&format!("cfg-checker-bad-{tag}"), &body);
+    }
+}
+
+/// The acceptance gate from the gdshader coordination update: the
+/// CURRENT deployed bridge.toml shape — 32 stanzas including the
+/// gdshader stanza with `send_root_path = true` — must load.
+#[test]
+fn deployed_bridge_toml_shape_loads() {
+    let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/deployed-bridge.toml");
+    let config = Config::load(&path).expect("deployed bridge.toml shape loads");
+    assert_eq!(config.servers.len(), 32);
+    assert!(config.checkers.is_empty());
+    let gdshader = config
+        .server_by_id("gdshader-lsp")
+        .expect("gdshader stanza present");
+    assert!(gdshader.send_root_path);
+    assert!(config.servers.iter().filter(|s| s.send_root_path).count() == 1);
+}
+
+// --- Checker parser goldens (design §9.1.2/9.1.4, §9.2.4, §9.2.6) ---
+
+const BAD_FRAG: &[u8] = include_bytes!("fixtures/checker/vulkan-bad.frag");
+const WARN_FRAG: &[u8] = include_bytes!("fixtures/checker/warn_ext.frag");
+const UNICODE_FRAG: &[u8] = include_bytes!("fixtures/checker/unicode-bad.frag");
+const NOMAIN_FRAG: &[u8] = include_bytes!("fixtures/checker/no-main.frag");
+
+/// The stdin-mode info log for the defective seed, captured on
+/// primo (checker design Appendix A.1, the `--error-column` run):
+/// framing line, two positioned errors, the aggregate line.
+fn bad_stderr() -> String {
+    concat!(
+        "stdin\n",
+        "ERROR: stdin:7:28: 'missing_alpha' : undeclared identifier",
+        " ",
+        "\n",
+        "ERROR: stdin:7:41: '' : compilation terminated",
+        " ",
+        "\n",
+        "ERROR: 2 compilation errors.  No code generated.\n",
+    )
+    .to_string()
+}
+
+fn parse(
+    target_bytes: &[u8],
+    exit_code: i32,
+    stderr: &str,
+) -> Result<Vec<Diagnostic>, BridgeError> {
+    parse_run(&ParseInput {
+        checker_id: "test-checker",
+        target_uri: "file:///ws/target.frag",
+        target_bytes,
+        sources: &[],
+        exit_code,
+        stderr,
+        max_diagnostics: 512,
+    })
+}
+
+#[test]
+fn parser_golden_defective_seed_yields_exactly_two_diagnostics() {
+    let diagnostics = parse(BAD_FRAG, 2, &bad_stderr()).expect("golden parse");
+    assert_eq!(diagnostics.len(), 2);
+    let first = &diagnostics[0];
+    assert_eq!(first.uri, "file:///ws/target.frag");
+    assert_eq!(first.range.start.line, 6);
+    assert_eq!(first.range.start.character, 27);
+    assert_eq!(first.range.end.line, 6);
+    assert_eq!(first.range.end.character, 40);
+    assert_eq!(first.severity, 1);
+    assert_eq!(first.source, "glslangValidator");
+    assert_eq!(first.channel, DiagnosticChannel::Checker);
+    assert_eq!(
+        first.message,
+        concat!("'missing_alpha' : undeclared identifier", " ")
+    );
+    let second = &diagnostics[1];
+    assert_eq!(second.range.start.line, 6);
+    assert_eq!(second.range.start.character, 40);
+    assert_eq!(second.range.end.character, 40);
+    assert_eq!(second.severity, 1);
+}
+
+#[test]
+fn parser_warning_seed_maps_both_warnings_at_severity_2() {
+    let stderr = concat!(
+        "stdin\n",
+        "WARNING: stdin:3:8: extension GL_ARB_separate_shader_objects is being used for location\n",
+        "WARNING: stdin:3:31: extension GL_ARB_separate_shader_objects is being used for location qualifier on output\n",
+    );
+    let diagnostics = parse(WARN_FRAG, 0, stderr).expect("warning parse");
+    assert_eq!(diagnostics.len(), 2);
+    assert!(diagnostics.iter().all(|d| d.severity == 2));
+    assert_eq!(diagnostics[0].range.start.line, 2);
+    assert_eq!(diagnostics[0].range.start.character, 7);
+    assert_eq!(diagnostics[1].range.start.character, 30);
+}
+
+#[test]
+fn parser_link_failure_is_one_file_level_diagnostic() {
+    let stderr = "stdin\nERROR: Linking fragment stage: Missing entry point: Each stage requires one entry point\n";
+    let diagnostics = parse(NOMAIN_FRAG, 3, stderr).expect("link parse");
+    assert_eq!(diagnostics.len(), 1);
+    let only = &diagnostics[0];
+    assert_eq!(only.range.start.line, 0);
+    assert_eq!(only.range.start.character, 0);
+    assert_eq!(only.range.end.character, 0);
+    assert_eq!(only.severity, 1);
+    assert_eq!(
+        only.message,
+        "Linking fragment stage: Missing entry point: Each stage requires one entry point"
+    );
+}
+
+#[test]
+fn parser_unicode_columns_convert_bytes_to_utf16() {
+    // Captured primo run (Appendix A.5): byte column 35 is the
+    // token start; the line's é (2 bytes) and 😀 (4 bytes, 2
+    // UTF-16 units) put the UTF-16 column at 31.
+    let stderr = concat!(
+        "stdin\n",
+        "ERROR: stdin:4:35: 'missing_value' : undeclared identifier",
+        " ",
+        "\n",
+        "ERROR: stdin:4:48: '' : compilation terminated",
+        " ",
+        "\n",
+        "ERROR: 2 compilation errors.  No code generated.\n",
+    );
+    let diagnostics = parse(UNICODE_FRAG, 2, stderr).expect("unicode parse");
+    assert_eq!(diagnostics.len(), 2);
+    assert_eq!(diagnostics[0].range.start.line, 3);
+    assert_eq!(diagnostics[0].range.start.character, 31);
+    assert_eq!(diagnostics[0].range.end.character, 44);
+    assert_eq!(diagnostics[1].range.start.character, 44);
+    assert_eq!(diagnostics[1].range.end.character, 44);
+}
+
+#[test]
+fn parser_mid_codepoint_column_is_invalid() {
+    // Byte column 11 lands inside the 😀 (bytes 10..13 of line 4).
+    let stderr = "stdin\nERROR: stdin:4:11: 'x' : undeclared identifier \n";
+    match parse(UNICODE_FRAG, 2, stderr) {
+        Err(BridgeError::CheckerOutputInvalid { .. }) => {}
+        other => panic!("expected CheckerOutputInvalid, got {other:?}"),
+    }
+}
+
+#[test]
+fn parser_malformed_output_family_is_invalid() {
+    // A positioned line without a column.
+    let no_column = concat!(
+        "stdin\n",
+        "ERROR: stdin:7: 'missing_alpha' : undeclared identifier",
+        " ",
+        "\n",
+        "ERROR: 2 compilation errors.  No code generated.\n",
+    );
+    assert!(matches!(
+        parse(BAD_FRAG, 2, no_column),
+        Err(BridgeError::CheckerOutputInvalid { .. })
+    ));
+    // An unknown severity token.
+    let unknown_severity = "stdin\nNOTICE: stdin:1:1: 'x' : hi\n";
+    assert!(matches!(
+        parse(BAD_FRAG, 0, unknown_severity),
+        Err(BridgeError::CheckerOutputInvalid { .. })
+    ));
+    // An aggregate count that disagrees with the positioned errors.
+    let mismatch = bad_stderr().replace("2 compilation errors", "3 compilation errors");
+    assert!(matches!(
+        parse(BAD_FRAG, 2, &mismatch),
+        Err(BridgeError::CheckerOutputInvalid { .. })
+    ));
+    // Exit 0 together with an ERROR line.
+    assert!(matches!(
+        parse(BAD_FRAG, 0, &bad_stderr()),
+        Err(BridgeError::CheckerOutputInvalid { .. })
+    ));
+    // A line of no known class at all.
+    let junk = "stdin\nsomething else entirely\n";
+    assert!(matches!(
+        parse(BAD_FRAG, 0, junk),
+        Err(BridgeError::CheckerOutputInvalid { .. })
+    ));
+    // Exit 2 with no mappable diagnostic is a failure, not a set.
+    assert!(matches!(
+        parse(BAD_FRAG, 2, "stdin\n"),
+        Err(BridgeError::CheckerFailed { .. })
+    ));
+}
+
+#[test]
+fn stage_derivation_compound_suffix_map_and_refusal() {
+    let body = format!("{GLSLD_SERVER}{VALID_CHECKER}");
+    let config = load_config("cfg-stage", &body).expect("config loads");
+    let entry = config.checker_by_id("glslang-vulkan-crosscheck").unwrap();
+    assert_eq!(
+        derive_stage(entry, Path::new("/ws/x.frag")).unwrap(),
+        "frag"
+    );
+    assert_eq!(
+        derive_stage(entry, Path::new("/ws/x.comp")).unwrap(),
+        "comp"
+    );
+    assert_eq!(
+        derive_stage(entry, Path::new("/ws/x.frag.glsl")).unwrap(),
+        "frag"
+    );
+    assert!(matches!(
+        derive_stage(entry, Path::new("/ws/x.glsl")),
+        Err(BridgeError::CheckerStageUnknown { .. })
+    ));
+}
+
+#[test]
+fn output_named_sources_finds_absolute_positioned_tokens() {
+    // The failed-include shape measured on primo: no depfile is
+    // written, and the header is named only in the log itself.
+    let stderr = concat!(
+        "stdin\n",
+        "ERROR: /ws/inc/common.glsl:1:35: 'nope_undeclared' : undeclared identifier",
+        " ",
+        "\n",
+        "ERROR: stdin:4:6: '' : compilation terminated",
+        " ",
+        "\n",
+    );
+    assert_eq!(
+        output_named_sources(stderr),
+        vec![PathBuf::from("/ws/inc/common.glsl")]
+    );
+    assert!(output_named_sources("stdin\n").is_empty());
+}
+
+#[test]
+fn depfile_parsing_drops_stdin_and_keeps_absolute_paths() {
+    let deps = parse_depfile("/tmp/out.spv: stdin /ws/inc/common.glsl /ws/inc/other.glsl\n");
+    assert_eq!(
+        deps,
+        vec![
+            PathBuf::from("/ws/inc/common.glsl"),
+            PathBuf::from("/ws/inc/other.glsl")
+        ]
+    );
+}

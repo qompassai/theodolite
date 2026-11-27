@@ -120,6 +120,67 @@ language_ids = { d = "d", di = "d" }
 readiness = "first-response"
 env = { PATH = "/usr/local/bin:/usr/bin:/bin" }
 
+# --- Checkers -----------------------------------------------------
+#
+# A [[checker]] stanza is NOT a language server: it pins a
+# one-shot command-line tool the bridge runs per document, on
+# sync, feeding the document's exact bytes on stdin and parsing
+# the tool's output through a named, versioned parser profile
+# (v1 has exactly one: "glslang-validator-1"). Checkers serve
+# `diagnostics` and `session_status` only; every other tool
+# refuses a checker id. Checker results are never merged with a
+# server's diagnostics.
+#
+# `authority` is required and has no default:
+# - "cross-check" — the checker runs only when a caller names its
+#   id explicitly, and its set is returned labelled, beside the
+#   owning server's set, never instead of it. A disagreement
+#   between a cross-check and the diagnostics owner is a
+#   conformance incident to investigate, not a vote.
+# - "owner" — the checker IS the diagnostics route for its
+#   extensions. Config load refuses an owner checker claiming an
+#   extension a diagnostics-owner [[server]] claims, and refuses
+#   two owner checkers on one extension: ownership is settled at
+#   load, never negotiated at call time.
+#
+# Server and checker ids share one namespace. Extension routing
+# (`server` omitted / by extension) considers [[server]] entries
+# only — a checker is reachable solely by its explicit id.
+#
+# The command is an argv vector, executed directly, never through
+# a shell. Placeholders substitute as whole elements only
+# ({path}, {relpath}, {stage}, {file_dir}, {project_root},
+# {output}, {depfile}); {output} and {depfile} are per-run
+# bridge-owned temp paths. One profile exception: glslang takes
+# its include directory glued ("-I<dir>" — a split "-I" is a
+# command-line error to the tool), so the two glued forms below
+# are admitted, in this order (the file's own directory first,
+# then the project root). The project root is the first directory
+# walking up from the file (workspace root at the latest) that
+# holds any of `root_markers`; the child runs with that as cwd.
+#
+# Bounds are refused outside their ranges at load: debounce_ms
+# 0..=5000, timeout_ms 100..=120000, max_input_bytes
+# 65536..=16777216, max_output_bytes 65536..=4194304,
+# max_diagnostics 1..=512. Crossing a bound at run time is a
+# typed error, never a truncated answer.
+
+[[checker]]
+id = "glslang-vulkan-crosscheck"
+parser = "glslang-validator-1"
+binary = "/usr/bin/glslangValidator"
+version_probe = ["--version"]
+expect_version = "RECORD-ON-TARGET-MACHINE"
+languages = ["glsl"]
+extensions = ["frag", "vert", "geom", "comp", "tesc", "tese", "glsl"]
+language_ids = { frag = "glsl", vert = "glsl", geom = "glsl", comp = "glsl", tesc = "glsl", tese = "glsl", glsl = "glsl" }
+stage_by_extension = { frag = "frag", vert = "vert", geom = "geom", comp = "comp", tesc = "tesc", tese = "tese" }
+authority = "cross-check"
+trigger = "on-sync"
+root_markers = [".git", "shaders.toml"]
+command = ["/usr/bin/glslangValidator", "-V", "--target-env", "vulkan1.3", "--error-column", "--stdin", "-S", "{stage}", "-I{file_dir}", "-I{project_root}", "--depfile", "{depfile}", "-o", "{output}"]
+env = { PATH = "/usr/local/bin:/usr/bin:/bin" }
+
 # gdshader-lsp (Godot shaders): the server reads its project
 # root ONLY from the deprecated `rootPath` initialize field
 # (its main.rs) and loads its builtin functions only when a

@@ -23,9 +23,9 @@
 
 use std::sync::Arc;
 
-use crate::config::{Config, Readiness};
+use crate::config::{CheckerAuthority, CheckerEntry, Config, Readiness};
 use crate::edits::{FileEdits, render_file_list, shape_workspace_edit, total_edits};
-use crate::errors::{BridgeError, BridgeResult};
+use crate::errors::{BridgeError, BridgeResult, io_error};
 use crate::session::{Session, SessionManager, resolve_within, validate_workspace};
 use crate::shaping::{
     Diagnostic, Location, MAX_RESULT_BYTES, MAX_SYMBOL_RESULT_BYTES, Position, Range,
@@ -294,6 +294,20 @@ pub fn call_tool(
     name: &str,
     arguments: &serde_json::Value,
 ) -> BridgeResult<serde_json::Value> {
+    // Checker ids serve `diagnostics` and `session_status` only
+    // (checker design §3.5): every other tool refuses them with a
+    // typed error, before any session machinery is touched.
+    if !matches!(name, "diagnostics" | "session_status")
+        && let Some(id) = arguments.get("server").and_then(|v| v.as_str())
+        && manager.config().checker_by_id(id).is_some()
+    {
+        return Err(BridgeError::UnsupportedMethod {
+            detail: format!(
+                "checker {id:?} serves diagnostics only; tool {name:?} is not available \
+                 for checker entries"
+            ),
+        });
+    }
     match name {
         "session_status" => tool_session_status(manager, arguments),
         "diagnostics" => tool_diagnostics(manager, arguments),
@@ -513,6 +527,135 @@ fn tool_rename_apply(
     Ok(result)
 }
 
+/// The `session_status` shape for a checker id (checker design
+/// §3.5): the run-record family — last run per document, the
+/// version transcript, the config hash — and no fabricated LSP
+/// phase or capabilities. A checker that has never run reports
+/// `not_started` with an empty run list.
+fn checker_status_json(
+    manager: &SessionManager,
+    entry: &CheckerEntry,
+    workspace: &std::path::Path,
+) -> serde_json::Value {
+    let (version, runs) = manager.checkers().status_snapshot(&entry.id, workspace);
+    let runs_json: Vec<serde_json::Value> = runs.iter().map(|record| record.to_json()).collect();
+    serde_json::json!({
+        "server": entry.id,
+        "kind": "checker",
+        "workspace": workspace.to_string_lossy(),
+        "phase": if runs.is_empty() { "not_started" } else { "ran" },
+        "bridge_version": env!("CARGO_PKG_VERSION"),
+        "config_hash": manager.config().config_hash,
+        "checker": {
+            "parser": entry.parser.as_str(),
+            "authority": entry.authority.as_str(),
+            "binary": entry.binary.to_string_lossy(),
+            "expect_version": entry.expect_version,
+            "tool_version_actual": version,
+        },
+        "runs": runs_json,
+    })
+}
+
+/// The `diagnostics` tool for a checker id (checker design §3):
+/// one document per call — a checker run is per-document by
+/// construction. The file's current bytes are read under the
+/// stanza's input bound, hashed, and handed to the checker
+/// manager; the result keeps the standard diagnostics envelope
+/// and adds the authority, the real diagnostics owner, and the
+/// run record.
+fn tool_checker_diagnostics(
+    manager: &SessionManager,
+    arguments: &serde_json::Value,
+    entry: &CheckerEntry,
+) -> BridgeResult<serde_json::Value> {
+    let workspace_raw = require_string(arguments, "workspace")?;
+    let workspace = validate_workspace(&workspace_raw)?;
+    let raw_path = match arguments.get("path") {
+        Some(path_value) => path_value
+            .as_str()
+            .ok_or_else(|| BridgeError::InvalidArgument {
+                detail: "argument \"path\" must be a string".to_string(),
+            })?,
+        None => {
+            return Err(BridgeError::InvalidArgument {
+                detail: "checker diagnostics requires a \"path\" argument: a checker \
+                         run is per-document"
+                    .to_string(),
+            });
+        }
+    };
+    let absolute = resolve_within(&workspace, raw_path)?;
+    // Refuse oversize input before reading it whole, and again on
+    // the bytes actually read (the file may have grown between).
+    let metadata =
+        std::fs::metadata(&absolute).map_err(|e| io_error("statting the checker target", e))?;
+    if metadata.len() > entry.max_input_bytes {
+        return Err(BridgeError::CheckerInputTooLarge {
+            checker: entry.id.clone(),
+            size: metadata.len(),
+            limit: entry.max_input_bytes,
+        });
+    }
+    let bytes = std::fs::read(&absolute).map_err(|e| io_error("reading the checker target", e))?;
+    if bytes.len() as u64 > entry.max_input_bytes {
+        return Err(BridgeError::CheckerInputTooLarge {
+            checker: entry.id.clone(),
+            size: bytes.len() as u64,
+            limit: entry.max_input_bytes,
+        });
+    }
+    if std::str::from_utf8(&bytes).is_err() {
+        return Err(BridgeError::CheckerInputInvalid {
+            checker: entry.id.clone(),
+            detail: format!("{} is not valid UTF-8", absolute.display()),
+        });
+    }
+    let (diagnostics, record) = manager
+        .checkers()
+        .diagnostics(entry, &workspace, &absolute, &bytes)?;
+    let mut shaped: Vec<Diagnostic> = Vec::with_capacity(diagnostics.len());
+    for mut diagnostic in diagnostics {
+        diagnostic.uri = relativize_uri(&diagnostic.uri, &workspace)?;
+        shaped.push(diagnostic);
+    }
+    sort_diagnostics(&mut shaped);
+    let items: Vec<serde_json::Value> = shaped.iter().map(diagnostic_json).collect();
+    // The diagnostics owner this result relates to (checker
+    // design §3.5): an owner checker is its own owner; a
+    // cross-check names the LSP server that owns the target's
+    // extension, falling back to the checker's own id when no
+    // owner server claims it.
+    let diagnostics_owner = match entry.authority {
+        CheckerAuthority::Owner => entry.id.clone(),
+        CheckerAuthority::CrossCheck => {
+            let extension = absolute
+                .extension()
+                .map(|ext| ext.to_string_lossy().into_owned())
+                .unwrap_or_default();
+            manager
+                .config()
+                .servers
+                .iter()
+                .find(|server| server.diagnostics_owner && server.extensions.contains(&extension))
+                .map(|server| server.id.clone())
+                .unwrap_or_else(|| entry.id.clone())
+        }
+    };
+    let result = serde_json::json!({
+        "server": entry.id,
+        "diagnostics_source": entry.id,
+        "channels": ["checker"],
+        "count": items.len(),
+        "diagnostics": items,
+        "authority": entry.authority.as_str(),
+        "diagnostics_owner": diagnostics_owner,
+        "checker_run": record.to_json(),
+    });
+    enforce_budget(&result, shaped.len(), MAX_RESULT_BYTES)?;
+    Ok(result)
+}
+
 fn tool_session_status(
     manager: &SessionManager,
     arguments: &serde_json::Value,
@@ -521,6 +664,9 @@ fn tool_session_status(
     let server_id = require_string(arguments, "server")?;
     let workspace = validate_workspace(&workspace_raw)?;
     if manager.config().server_by_id(&server_id).is_none() {
+        if let Some(entry) = manager.config().checker_by_id(&server_id) {
+            return Ok(checker_status_json(manager, entry, &workspace));
+        }
         return Err(BridgeError::InvalidArgument {
             detail: format!("no configured server with id {server_id:?}"),
         });
@@ -555,6 +701,12 @@ fn tool_diagnostics(
     manager: &SessionManager,
     arguments: &serde_json::Value,
 ) -> BridgeResult<serde_json::Value> {
+    // A checker id routes to the checker manager, never to a
+    // session (checker design §3.5).
+    let server_id = require_string(arguments, "server")?;
+    if let Some(entry) = manager.config().checker_by_id(&server_id).cloned() {
+        return tool_checker_diagnostics(manager, arguments, &entry);
+    }
     let (session, server_id) = session_for(manager, arguments)?;
     session.ensure_ready(manager.config())?;
     let only_uri = match arguments.get("path") {

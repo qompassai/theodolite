@@ -1356,22 +1356,33 @@ pub struct SessionManager {
     /// client asserts about itself inside the MCP host's process
     /// boundary (SPEC §8's auth model), not an authentication.
     client_identity: Mutex<Option<String>>,
+    /// The checker manager: a sibling registry beside the session
+    /// map. Checker runs are one-shot and keep no `Session`
+    /// (checker design §10.1).
+    checkers: crate::checker::CheckerManager,
 }
 
 impl SessionManager {
     /// Create an empty manager bound to a validated config.
     pub fn new(config: Arc<Config>) -> SessionManager {
+        let checkers = crate::checker::CheckerManager::new(&config.config_hash);
         SessionManager {
             config,
             sessions: Mutex::new(HashMap::new()),
             started: Instant::now(),
             client_identity: Mutex::new(None),
+            checkers,
         }
     }
 
     /// The bound config.
     pub fn config(&self) -> &Config {
         &self.config
+    }
+
+    /// The checker manager serving this bridge process.
+    pub fn checkers(&self) -> &crate::checker::CheckerManager {
+        &self.checkers
     }
 
     /// Record the client identity from the MCP handshake. An empty
@@ -1531,15 +1542,39 @@ pub fn resolve_within(workspace_root: &Path, raw: &str) -> BridgeResult<PathBuf>
     Ok(canonical)
 }
 
-/// Probe a server's version: run `<binary> <probe argv>` with a
-/// scrubbed environment, a deadline, and a bounded output. The
-/// actual version string is the trimmed stdout, falling back to
-/// the trimmed stderr when stdout is empty: several real servers
-/// (serve-d is one) print their version text on stderr only
-/// (SPEC §4.1).
-fn probe_version(entry: &ServerEntry) -> BridgeResult<String> {
-    let mut command = Command::new(&entry.binary);
-    command.args(&entry.version_probe);
+/// Why a version probe failed, before the caller maps the
+/// failure to its own public error type: sessions render these as
+/// `ServerNotReady`/`Io` exactly as they always have; the checker
+/// manager renders them as `CheckerUnavailable`. The detail
+/// strings are the historical ones, so both mappings produce
+/// identical text for identical conditions.
+#[derive(Debug)]
+pub(crate) enum VersionProbeFailure {
+    /// Spawn, wait, or read I/O failure; carries the full detail
+    /// text (`"<context>: <source error>"`).
+    Io(String),
+    /// The probe exceeded its deadline and was killed.
+    Timeout,
+    /// The probe exited non-zero; carries the status string.
+    NonZeroExit(String),
+    /// The probe's output crossed the byte cap.
+    OutputTooLarge,
+}
+
+/// Run `<binary> <probe argv>` with a scrubbed environment, a
+/// deadline, and a bounded output. The actual version string is
+/// the trimmed stdout, falling back to the trimmed stderr when
+/// stdout is empty: several real servers (serve-d is one) print
+/// their version text on stderr only (SPEC §4.1). This is the one
+/// probe implementation for the whole bridge — servers and
+/// checkers pin their tools by the identical code path and
+/// semantics (checker design §10.1).
+pub(crate) fn run_version_probe(
+    binary: &Path,
+    version_probe: &[String],
+) -> Result<String, VersionProbeFailure> {
+    let mut command = Command::new(binary);
+    command.args(version_probe);
     command.env_clear();
     if let Ok(home) = std::env::var("HOME") {
         command.env("HOME", home);
@@ -1548,7 +1583,7 @@ fn probe_version(entry: &ServerEntry) -> BridgeResult<String> {
     command.stdout(Stdio::piped()).stderr(Stdio::piped());
     let mut child = command
         .spawn()
-        .map_err(|e| io_error("spawning version probe", e))?;
+        .map_err(|e| VersionProbeFailure::Io(format!("spawning version probe: {e}")))?;
     let deadline = Instant::now() + Duration::from_millis(VERSION_PROBE_TIMEOUT_MS);
     let status = loop {
         match child.try_wait() {
@@ -1556,34 +1591,29 @@ fn probe_version(entry: &ServerEntry) -> BridgeResult<String> {
             Ok(None) => {
                 if Instant::now() >= deadline {
                     let _ = child.kill();
-                    return Err(BridgeError::ServerNotReady {
-                        server: entry.id.clone(),
-                        detail: "version probe exceeded its deadline".to_string(),
-                    });
+                    return Err(VersionProbeFailure::Timeout);
                 }
                 std::thread::sleep(Duration::from_millis(10));
             }
-            Err(e) => return Err(io_error("waiting on version probe", e)),
+            Err(e) => {
+                return Err(VersionProbeFailure::Io(format!(
+                    "waiting on version probe: {e}"
+                )));
+            }
         }
     };
     if !status.success() {
-        return Err(BridgeError::ServerNotReady {
-            server: entry.id.clone(),
-            detail: format!("version probe exited with {status}"),
-        });
+        return Err(VersionProbeFailure::NonZeroExit(format!("{status}")));
     }
     let mut output = Vec::new();
     if let Some(mut stdout) = child.stdout.take() {
         let mut limited = Read::take(&mut stdout, (VERSION_PROBE_MAX_BYTES + 1) as u64);
         limited
             .read_to_end(&mut output)
-            .map_err(|e| io_error("reading version probe output", e))?;
+            .map_err(|e| VersionProbeFailure::Io(format!("reading version probe output: {e}")))?;
     }
     if output.len() > VERSION_PROBE_MAX_BYTES {
-        return Err(BridgeError::ServerNotReady {
-            server: entry.id.clone(),
-            detail: "version probe output exceeds its byte cap".to_string(),
-        });
+        return Err(VersionProbeFailure::OutputTooLarge);
     }
     if String::from_utf8_lossy(&output).trim().is_empty() {
         // The serve-d case: the version text exists, but on stderr.
@@ -1593,21 +1623,38 @@ fn probe_version(entry: &ServerEntry) -> BridgeResult<String> {
         let mut err_output = Vec::new();
         if let Some(mut stderr) = child.stderr.take() {
             let mut limited = Read::take(&mut stderr, (VERSION_PROBE_MAX_BYTES + 1) as u64);
-            limited
-                .read_to_end(&mut err_output)
-                .map_err(|e| io_error("reading version probe stderr", e))?;
+            limited.read_to_end(&mut err_output).map_err(|e| {
+                VersionProbeFailure::Io(format!("reading version probe stderr: {e}"))
+            })?;
         }
         if err_output.len() > VERSION_PROBE_MAX_BYTES {
-            return Err(BridgeError::ServerNotReady {
-                server: entry.id.clone(),
-                detail: "version probe output exceeds its byte cap".to_string(),
-            });
+            return Err(VersionProbeFailure::OutputTooLarge);
         }
         if !String::from_utf8_lossy(&err_output).trim().is_empty() {
             output = err_output;
         }
     }
     Ok(String::from_utf8_lossy(&output).trim().to_string())
+}
+
+/// Probe a server's version, mapping probe failures to the
+/// session error surface exactly as before the extraction.
+fn probe_version(entry: &ServerEntry) -> BridgeResult<String> {
+    run_version_probe(&entry.binary, &entry.version_probe).map_err(|failure| match failure {
+        VersionProbeFailure::Io(detail) => BridgeError::Io { detail },
+        VersionProbeFailure::Timeout => BridgeError::ServerNotReady {
+            server: entry.id.clone(),
+            detail: "version probe exceeded its deadline".to_string(),
+        },
+        VersionProbeFailure::NonZeroExit(status) => BridgeError::ServerNotReady {
+            server: entry.id.clone(),
+            detail: format!("version probe exited with {status}"),
+        },
+        VersionProbeFailure::OutputTooLarge => BridgeError::ServerNotReady {
+            server: entry.id.clone(),
+            detail: "version probe output exceeds its byte cap".to_string(),
+        },
+    })
 }
 
 /// Spawn one session's process tree under the estate's

@@ -1,0 +1,635 @@
+# Theodolite bridge config — full-coverage deployment.
+#
+# History: deployed 2026-11-03 (D-879) with ONE pinned server
+# (rust-analyzer via ~/.cargo/bin, which is the rustup proxy — kept
+# working by its PATH env, but against the example config's rule).
+# Rebuilt 2026-11-09 under the Owner's order that agents use
+# theodolite with LSPs for ALL file types: restores the canonical
+# W4-proven Rust pairing (bacon-ls diagnostics owner + rust-analyzer
+# semantics on the SPEC-pinned nightly toolchain binary, never the
+# proxy) and adds a stanza for every language whose server exists on
+# primo, per the D-151 coverage SPEC
+# (~/workspace/theodolite-coverage-20261027/SPEC.md) plus Python and
+# TypeScript, whose servers are installed and whose deferral the
+# Owner's order supersedes for availability.
+#
+# Servers needing argv or a transport the bridge cannot express are
+# reached through wrappers in ~/.local/share/theodolite/bin/ (the
+# bridge spawns `binary` bare and probes `binary --version`):
+#   taplo-lsp     -> taplo lsp stdio
+#   ts-lsp        -> typescript-language-server --stdio
+#   kotlin-lsp    -> kotlin-language-server (crashes on ANY argv;
+#                    the wrapper answers the probe itself)
+#   gdscript-lsp  -> socat stdio<->TCP 127.0.0.1:6005 (the GDScript
+#                    LSP lives inside a running Godot editor)
+#
+# Ren'Py (.rpy) has NO stanza: no standalone or distro-packaged
+# Ren'Py language server exists (SPEC SS4.9). Coverage there is an
+# extraction slice (official VS Code extension's bundled server),
+# still pending; until it lands, .rpy has no LSP route and agents
+# must say so rather than improvise one.
+#
+# Every expect_version below was probed on primo on 2026-11-09.
+# The bridge's version check is an EXACT full-string match against
+# the probe's trimmed output (proven 2026-11-09: expect "0.10.0" vs
+# probed "taplo 0.10.0" -> ServerVersionMismatch). Corrolary: the
+# 2026-11-03 deployment's rust expect "1" could never have matched
+# its probe output — that pin was broken from the day it landed.
+
+request_timeout_ms = 120000
+ready_timeout_ms = 300000
+shutdown_grace_ms = 2000
+mutation = "off"
+
+# --- Rust: canonical pair. bacon-ls owns diagnostics (W4 parity:
+# bridge diagnostics == standalone bacon-ls); rust-analyzer serves
+# semantics, readiness quiescent (Slice 0 lesson: never read
+# semantics from a server that has not reported quiescent).
+[[server]]
+id = "bacon-ls"
+binary = "/home/phaedrus/.cargo/bin/bacon-ls"
+version_probe = ["--version"]
+expect_version = "0.23.0"
+languages = ["rust"]
+extensions = ["rs"]
+language_ids = { rs = "rust" }
+readiness = "immediate"
+diagnostics_owner = true
+# 2026-11-10 cure (theodolite Rust-route review): bacon-ls 0.23.0
+# flipped its default backend from Bacon to Cargo. Without this
+# option the server never reads .bacon-locations, and its Cargo
+# backend cannot find the project root of a non-git workspace
+# under the bridge (git rev-parse short-circuit), so every Rust
+# diagnostics read through the bridge was a silent zero.
+initialization_options = { useBaconBackend = true }
+env = { PATH = "/home/phaedrus/.cargo/bin:/usr/local/bin:/usr/bin:/bin" }
+
+[[server]]
+id = "rust-analyzer"
+binary = "/home/phaedrus/.rustup/toolchains/nightly-2026-09-25-x86_64-unknown-linux-gnu/bin/rust-analyzer"
+version_probe = ["--version"]
+expect_version = "rust-analyzer 1.100.0-nightly (f7575a9 2026-09-24)"
+languages = ["rust"]
+extensions = ["rs"]
+language_ids = { rs = "rust" }
+readiness = "quiescent"
+initialization_options = {}
+env = { PATH = "/home/phaedrus/.cargo/bin:/usr/local/bin:/usr/bin:/bin" }
+
+# --- Lua: lua-language-server 3.19.2 (Arch package, /usr/bin).
+[[server]]
+id = "lua-language-server"
+binary = "/usr/bin/lua-language-server"
+version_probe = ["--version"]
+expect_version = "3.19.2"
+# 2026-11-24 coverage lane: same no-publish-on-clean shape as nil
+# (LuaLS publishes only files WITH diagnostics on workspace load;
+# clean-file bridge reads timed out at 200-280 s x3). Trial of the
+# nil cure on this stanza; revert if the bridge ignores it here.
+no_publish_means_empty_ms = 5000
+languages = ["lua"]
+extensions = ["lua"]
+language_ids = { lua = "lua" }
+readiness = "immediate"
+diagnostics_owner = true
+env = {}
+
+# --- TOML: taplo 0.10.0 via wrapper (needs `lsp stdio` argv).
+[[server]]
+id = "taplo"
+binary = "/home/phaedrus/.local/share/theodolite/bin/taplo-lsp"
+version_probe = ["--version"]
+expect_version = "taplo 0.10.0"
+languages = ["toml"]
+extensions = ["toml"]
+language_ids = { toml = "toml" }
+readiness = "immediate"
+diagnostics_owner = true
+env = { PATH = "/usr/local/bin:/usr/bin:/bin" }
+
+# --- WGSL: wgsl-analyzer (Arch package 20260930-2; the binary stamps
+# no semver, --version prints 0.0.0 — the probe matches the printed
+# string, per SPEC SS4.5). initialization_options carries diver's
+# wgslana_ls.lua diagnostics block.
+[[server]]
+id = "wgsl-analyzer"
+binary = "/usr/bin/wgsl-analyzer"
+version_probe = ["--version"]
+expect_version = "wgsl-analyzer 0.0.0"
+languages = ["wgsl"]
+extensions = ["wgsl"]
+language_ids = { wgsl = "wgsl" }
+readiness = "immediate"
+diagnostics_owner = true
+initialization_options = { "wgsl-analyzer" = { diagnostics = { enable = true, experimental = { enable = true } } } }
+env = { PATH = "/usr/local/bin:/usr/bin:/bin" }
+
+# --- RON: ron-lsp 0.1.4 (cargo install, ~/.cargo/bin). The games'
+# data format (Strobe / Torogao / Hands-On .ron files).
+[[server]]
+id = "ron-lsp"
+binary = "/home/phaedrus/.cargo/bin/ron-lsp"
+version_probe = ["--version"]
+expect_version = "ron-lsp 0.1.4"
+languages = ["ron"]
+extensions = ["ron"]
+language_ids = { ron = "ron" }
+readiness = "immediate"
+diagnostics_owner = true
+env = { PATH = "/home/phaedrus/.cargo/bin:/usr/local/bin:/usr/bin:/bin" }
+
+# --- C#: Microsoft Roslyn language server (Arch package
+# csharp-language-server; binary --version 0.7.1; needs only the
+# .NET runtime, present at /usr/bin/dotnet). SPEC SS4.6 candidate 1,
+# adopted 2026-11-09 (D-1124): primo already carries it and Strobe's
+# reference Core is a modern .NET codebase. Diver's catalogued
+# csharp-ls is NOT installed; the divergence is recorded, not
+# drifted into. first-response readiness: solution load is the C#
+# analogue of the workspace-load race.
+[[server]]
+id = "csharp-language-server"
+binary = "/usr/bin/csharp-language-server"
+version_probe = ["--version"]
+expect_version = "csharp-language-server 0.7.1"
+languages = ["csharp"]
+extensions = ["cs"]
+language_ids = { cs = "csharp" }
+readiness = "first-response"
+diagnostics_owner = true
+# The wrapper installs its inner Roslyn server via `dotnet restore`,
+# which needs an SDK, and the restored payload (5.4.0-2.26060.1)
+# targets Microsoft.NETCore.App 10.0.0; primo carries only the
+# runtime system-wide, so the stanza points at the user-level .NET
+# root installed 2026-11-09 (~/.local/share/dotnet-sdk,
+# dotnet-install.sh): SDK 8.0.427 + SDK/runtime 10.0.14 side by side.
+env = { PATH = "/home/phaedrus/.local/share/dotnet-sdk:/usr/local/bin:/usr/bin:/bin", DOTNET_ROOT = "/home/phaedrus/.local/share/dotnet-sdk" }
+
+# --- Kotlin: fwcd kotlin-language-server 1.3.13 (diver's catalogued
+# choice) via wrapper — the server crashes on any argv, so the
+# wrapper answers the version probe and execs it bare. Gradle import
+# makes first load slow: first-response readiness.
+[[server]]
+id = "kotlin-language-server"
+binary = "/home/phaedrus/.local/share/theodolite/bin/kotlin-lsp"
+version_probe = ["--version"]
+expect_version = "kotlin-language-server 1.3.13"
+languages = ["kotlin"]
+extensions = ["kt", "kts"]
+language_ids = { kt = "kotlin", kts = "kotlin" }
+readiness = "first-response"
+diagnostics_owner = true
+env = { PATH = "/usr/local/bin:/usr/bin:/bin" }
+
+# --- Python: jedi-language-server 0.47.0 (already installed; SPEC
+# SS4.10 deferred Python pending phlow's WS2, but the Owner's
+# all-file-types order makes availability standing now — evidence
+# sessions still gate any "covered" claim).
+[[server]]
+id = "jedi-language-server"
+binary = "/usr/bin/jedi-language-server"
+version_probe = ["--version"]
+expect_version = "0.47.0"
+languages = ["python"]
+extensions = ["py"]
+language_ids = { py = "python" }
+readiness = "immediate"
+diagnostics_owner = true
+env = { PATH = "/usr/local/bin:/usr/bin:/bin" }
+
+# --- TypeScript/JavaScript: typescript-language-server 6.0.0 via
+# wrapper (needs --stdio). SPEC SS4.11 found no live consumer; the
+# stanza makes the route available per the Owner's order.
+[[server]]
+id = "typescript-language-server"
+binary = "/home/phaedrus/.local/share/theodolite/bin/ts-lsp"
+version_probe = ["--version"]
+expect_version = "6.0.0"
+languages = ["typescript", "javascript"]
+extensions = ["ts", "tsx", "js", "jsx"]
+language_ids = { ts = "typescript", tsx = "typescriptreact", js = "javascript", jsx = "javascriptreact" }
+readiness = "immediate"
+diagnostics_owner = true
+env = { PATH = "/usr/local/bin:/usr/bin:/bin" }
+
+# --- D: serve-d, source-built at ~/.local/bin (the Arch package
+# cannot load libphobos2-ldc-shared.so.111; live parity against this
+# binary PASSED 2026-10-26). first-response per the example config:
+# serve-d loads its dub workspace and starts DCD on its own schedule
+# and never presents a quiescent window inside the ready timeout.
+[[server]]
+id = "serve-d"
+binary = "/home/phaedrus/.local/bin/serve-d"
+version_probe = ["--version"]
+expect_version = '''serve-d v0.7.6 with workspace-d v3.7.0
+Included features: "d", "workspaces"
+Built: Mon Oct 26 11:37:41 2026
+with compiler LDC v2.113 on linux littleEndian
+dub, dfmt and dscanner are bundled within (compiled in)'''
+languages = ["d"]
+extensions = ["d", "di"]
+language_ids = { d = "d", di = "d" }
+readiness = "first-response"
+diagnostics_owner = true
+env = { PATH = "/home/phaedrus/.local/bin:/usr/local/bin:/usr/bin:/bin" }
+
+# --- GDScript: no standalone server exists; the LSP is embedded in
+# the Godot editor (TCP 127.0.0.1:6005). The shim bridges stdio to
+# that port, so a session needs a running editor:
+#   godot --headless --editor --path <godot-project>
+# With no editor listening the session refuses (socat connect
+# failure) rather than hanging.
+[[server]]
+id = "gdscript"
+binary = "/home/phaedrus/.local/share/theodolite/bin/gdscript-lsp"
+version_probe = ["--version"]
+expect_version = "4.7.2.stable.arch_linux.ed1daf0bf"
+languages = ["gdscript"]
+extensions = ["gd"]
+language_ids = { gd = "gdscript" }
+readiness = "first-response"
+diagnostics_owner = true
+env = { PATH = "/usr/local/bin:/usr/bin:/bin" }
+
+# --- Ren'Py: rockettap/renpy-language-server 0.2.1 (unofficial,
+# Python/pygls), pinned at upstream tag v0.2.1 = commit
+# 98859904fbc9b083ab51de40391928eacd657484, installed in the
+# dedicated venv ~/.local/share/theodolite/renpy-ls-venv (pip
+# direct_url.json records the pin). Adopted 2026-11-09 by Owner
+# order (B8 evaluation: symbols + seeded-defect diagnostics both
+# serve through the bridge). The server has no --version of its
+# own, so the wrapper in bin/ answers the probe itself (the
+# kotlin-lsp shape). Sizing discipline (measured in B8): the
+# server scans the workspace inside initialize — scope the
+# workspace to the game's script tree, not a full game tree.
+# first-response readiness per the eval stanza.
+[[server]]
+id = "renpy-language-server"
+binary = "/home/phaedrus/.local/share/theodolite/bin/renpy-lsp"
+version_probe = ["--version"]
+expect_version = "renpy-language-server 0.2.1"
+languages = ["renpy"]
+extensions = ["rpy"]
+readiness = "first-response"
+
+# --- Nix: nil (Arch package, /usr/bin). Added 2026-11-15 by Owner
+# order, closing the no-nix-route gap the SSD config audit found the
+# same day. nil is the audit's proven server: in the diver pass it
+# attached to all 139 files of the deployed tree, caught the planted
+# syntax error, and found all 4 real syntax errors. nixd was NOT
+# chosen: in the same audit's bulk run it attached to 0 files and
+# nvim logged 15x "nixd_ls quit with exit code 0 and signal 13", and
+# diver's nixd settings point its option lookup at another flake
+# ("k-on"). nil --version prints "nil unknown" (the Arch build
+# stamps no version) — the probe matches the printed string, per
+# the wgsl-analyzer precedent above.
+[[server]]
+id = "nil"
+binary = "/usr/bin/nil"
+version_probe = ["--version"]
+expect_version = "nil unknown"
+languages = ["nix"]
+extensions = ["nix"]
+language_ids = { nix = "nix" }
+readiness = "immediate"
+diagnostics_owner = true
+# nil publishes publishDiagnostics ONLY for non-empty sets: a
+# clean file gets no notification at all (measured 2026-11-15/16,
+# standalone and through the bridge), so the evidence-only
+# settle wait held a clean file to the ready deadline and
+# failed ServerNotReady. This opt-in is the scoped cure
+# (theodolite branch pax/nil-clean-file-20261116): after 5 s of
+# silence following the last content sync, the absent publish
+# IS the empty set. nil's dirty-file publish lands in ~0.6 s;
+# 5 s is ~8x that. Nil-only: every other stanza keeps the
+# evidence-only predicate.
+no_publish_means_empty_ms = 5000
+env = { PATH = "/usr/local/bin:/usr/bin:/bin" }
+
+# =====================================================================
+# Coverage build-out 2026-11-24 (Owner commission + tier-2 addendum).
+# Catalog of record: Diver lsp/README.md + lsp/*_ls.lua. Every
+# expect_version below was probed on primo on 2026-11-24 (wrapper
+# pins cite their source in the wrapper scripts). Servers needing
+# argv, lacking a --version, or living in a runtime the bridge
+# cannot spawn directly go through wrappers in bin/ (bridge law).
+# =====================================================================
+
+# --- Zig: zls 0.15.1 (Arch package, /usr/bin). Diver z_ls. Note:
+# primo's zig is 0.17.1; zls 0.15.1 is the packaged pairing and is
+# what the controls below were run against.
+[[server]]
+id = "zls"
+binary = "/usr/bin/zls"
+version_probe = ["--version"]
+expect_version = "0.17.0"
+languages = ["zig"]
+extensions = ["zig", "zon"]
+language_ids = { zig = "zig", zon = "zig" }
+readiness = "immediate"
+diagnostics_owner = true
+env = { PATH = "/usr/local/bin:/usr/bin:/bin" }
+
+# --- CMake: neocmakelsp 0.11.2 (Arch package) via wrapper (needs
+# `stdio` argv). PICK CHANGED 2026-11-24 during this build-out:
+# diver lists cmake_ls AND neocmake_ls; first pick was
+# cmake-language-server 0.1.11, but in standalone controls it
+# served NOTHING (no diagnostics on any seed, documentSymbol =
+# MethodNotFound), while neocmakelsp serves symbols/hover and a
+# pull-diagnostics surface. Both servers returned ZERO diagnostics
+# on every seeded defect tried (see COVERAGE.md) — the CMake row
+# is FAIL on the diagnostics control for both; neocmakelsp is
+# wired as the strictly larger working surface.
+# ROUTING NOTE: the bridge routes by file extension only, and
+# CMakeLists.txt has extension "txt" — this stanza claims "txt"
+# (nothing else serves it) so real CMakeLists.txt files route;
+# callers must name servers explicitly for plain .txt files.
+[[server]]
+id = "neocmakelsp"
+binary = "/home/phaedrus/.local/share/theodolite/bin/neocmake-lsp"
+version_probe = ["--version"]
+expect_version = "neocmakelsp 0.11.2"
+languages = ["cmake"]
+extensions = ["cmake", "txt"]
+language_ids = { cmake = "cmake", txt = "cmake" }
+readiness = "immediate"
+diagnostics_owner = true
+env = { PATH = "/usr/local/bin:/usr/bin:/bin" }
+
+# --- CSS: vscode-css-language-server (Arch package, VS Code
+# extracted) via wrapper (no --version; needs --stdio). Diver css_ls.
+[[server]]
+id = "vscode-css-language-server"
+binary = "/home/phaedrus/.local/share/theodolite/bin/css-lsp"
+version_probe = ["--version"]
+expect_version = "vscode-css-language-server 1.136.0"
+languages = ["css"]
+extensions = ["css", "scss", "less"]
+language_ids = { css = "css", scss = "scss", less = "less" }
+readiness = "immediate"
+diagnostics_owner = true
+env = { PATH = "/usr/local/bin:/usr/bin:/bin" }
+
+# --- Crates: crates-lsp 0.4.3 (Arch package) via wrapper (its
+# --version prints nothing). Diver crates_ls. Serves Cargo.toml
+# dependency diagnostics; taplo remains the TOML diagnostics owner
+# (this stanza is diagnostics_owner = false and is addressed by
+# server name for Cargo.toml files; its init options carry diver's
+# crates_ls block: Cargo.toml files only, no crates.io API).
+[[server]]
+id = "crates-lsp"
+binary = "/home/phaedrus/.local/share/theodolite/bin/crates-lsp"
+version_probe = ["--version"]
+expect_version = "crates-lsp 0.4.3"
+languages = ["toml"]
+extensions = ["toml"]
+language_ids = { toml = "toml" }
+readiness = "immediate"
+diagnostics_owner = false
+initialization_options = { files = ["Cargo.toml"], use_api = false, diagnostics = true, unknown_dep_severity = 2, needs_update_severity = 3, up_to_date_severity = 4 }
+env = { PATH = "/usr/local/bin:/usr/bin:/bin" }
+
+# --- GLSL: glsld 0.3.0 (daiyousei-qz/glsld official release binary)
+# via wrapper (upstream diagnostics are experimental and OFF by
+# default; the wrapper passes the config that enables them).
+# REPLACED glsl_analyzer 2026-11-24 (shader lane): glsl_analyzer
+# v1.7.1 (and upstream main) has NO LSP diagnostics code path --
+# dispatch table is completion/hover/formatting/definition only,
+# pull returns MethodNotFound, nothing is ever published; its parse
+# diagnostics surface only via its --parse-file CLI. Evidence:
+# theodolite-coverage-20261124/SHADER-ADDENDUM.md.
+[[server]]
+id = "glsld"
+binary = "/home/phaedrus/.local/share/theodolite/bin/glsl-lsp"
+version_probe = ["--version"]
+expect_version = "glsld 0.3.0"
+languages = ["glsl"]
+extensions = ["glsl", "vert", "frag", "geom", "comp", "tesc", "tese"]
+language_ids = { glsl = "glsl", vert = "glsl", frag = "glsl", geom = "glsl", comp = "glsl", tesc = "glsl", tese = "glsl" }
+readiness = "immediate"
+diagnostics_owner = true
+env = { PATH = "/usr/local/bin:/usr/bin:/bin" }
+
+# --- JSON: vscode-json-language-server (Arch package) via wrapper
+# (no --version; needs --stdio). Diver json_ls.
+[[server]]
+id = "vscode-json-language-server"
+binary = "/home/phaedrus/.local/share/theodolite/bin/json-lsp"
+version_probe = ["--version"]
+expect_version = "vscode-json-language-server 1.136.0"
+languages = ["json"]
+extensions = ["json", "jsonc"]
+language_ids = { json = "json", jsonc = "jsonc" }
+readiness = "immediate"
+diagnostics_owner = true
+env = { PATH = "/usr/local/bin:/usr/bin:/bin" }
+
+# --- Mojo: mojo-lsp-server (Mojo 1.2.0, pixi global env) via
+# wrapper. Its --version prints the LLVM banner below (exact,
+# all lines) — that banner IS the pin, per bridge law.
+[[server]]
+id = "mojo-lsp-server"
+binary = "/home/phaedrus/.local/share/theodolite/bin/mojo-lsp"
+version_probe = ["--version"]
+expect_version = '''LLVM (http://llvm.org/):
+  LLVM version 24.0.0git
+  Optimized build.'''
+languages = ["mojo"]
+extensions = ["mojo"]
+language_ids = { mojo = "mojo" }
+readiness = "immediate"
+diagnostics_owner = true
+env = { PATH = "/home/phaedrus/.pixi/envs/mojo/bin:/usr/local/bin:/usr/bin:/bin" }
+
+# --- Make: autotools-language-server 0.1.3 (uv tool install,
+# ~/.local/bin). Diver's Make entry (autotoo_ls). ROUTING NOTE:
+# a bare "Makefile" has no file extension and the bridge routes
+# by extension, so Make coverage routes .mk/.make files; the
+# bare-name gap is recorded in COVERAGE.md.
+[[server]]
+id = "autotools-language-server"
+binary = "/home/phaedrus/.local/bin/autotools-language-server"
+version_probe = ["--version"]
+expect_version = "0.1.3"
+languages = ["make"]
+extensions = ["mk", "make"]
+language_ids = { mk = "make", make = "make" }
+readiness = "immediate"
+diagnostics_owner = true
+env = { PATH = "/home/phaedrus/.local/bin:/usr/local/bin:/usr/bin:/bin" }
+
+# --- Shader: shader-ls 0.1.3 (NuGet dotnet tool, repo
+# shader-ls/shader-language-server) via wrapper (net7.0 tool on
+# roll-forward; needs --stdio). Diver shader_ls: ShaderLab + HLSL.
+# Distinct from GLSL (glsl-analyzer above) and from Godot shaders
+# (gdshader-lsp, report-only in COVERAGE.md). The hlsl extension
+# claim moved to slangd 2026-11-24 (shader lane): shader-ls has
+# NO diagnostics implementation (source + shipped dll contain
+# no diagnostics handler at all); slangd is the working HLSL
+# diagnostics route. This stanza keeps the ShaderLab surface
+# (hover/completion/signature help). See SHADER-ADDENDUM.md.
+[[server]]
+id = "shader-ls"
+binary = "/home/phaedrus/.local/share/theodolite/bin/shader-lsp"
+version_probe = ["--version"]
+expect_version = "shader-ls 0.1.3"
+languages = ["shaderlab"]
+extensions = ["shader", "cg"]
+language_ids = { shader = "shaderlab", cg = "cg" }
+readiness = "immediate"
+diagnostics_owner = true
+no_publish_means_empty_ms = 5000
+env = { PATH = "/home/phaedrus/.local/share/dotnet-sdk:/usr/local/bin:/usr/bin:/bin" }
+
+# --- Slang / HLSL: slangd 2026.22.1 (shader-slang/slang official
+# release) via wrapper (slangd has no --version exit path; the
+# probe is answered from the release's own slangc -v). Diver
+# slangd_ls: filetypes hlsl + shaderslang. HLSL diagnostics route
+# of record -- fires where shader-ls has no diagnostics code.
+[[server]]
+id = "slangd"
+binary = "/home/phaedrus/.local/share/theodolite/bin/slangd-lsp"
+version_probe = ["--version"]
+expect_version = "2026.22.1"
+languages = ["hlsl", "slang"]
+extensions = ["hlsl", "slang"]
+language_ids = { hlsl = "hlsl", slang = "slang" }
+readiness = "immediate"
+diagnostics_owner = true
+initialization_options = { slang = { predefinedMacros = {}, additionalSearchPaths = [] } }
+no_publish_means_empty_ms = 5000
+env = { PATH = "/usr/local/bin:/usr/bin:/bin" }
+
+# --- GDShader: gdshader-lsp 0.1.0 (GodOfAvacyn/gdshader-lsp,
+# cargo install) via wrapper (binary has no --version exit path;
+# any invocation starts the server). Diver gdshader_ls. The
+# server reads its project root ONLY from the legacy rootPath
+# initialize field (src/main.rs) and loads its builtins only
+# when a root exists, so the stanza opts in to the bridge's
+# send_root_path field (theodolite fix, 2026-11-24): initialize
+# carries rootPath beside rootUri/workspaceFolders for this
+# server only. Without it, every builtin call false-positives
+# ("Function 'vec3' does not exist") -- SHADER-ADDENDUM item 4.
+[[server]]
+id = "gdshader-lsp"
+binary = "/home/phaedrus/.local/share/theodolite/bin/gdshader-lsp"
+version_probe = ["--version"]
+expect_version = "gdshader-lsp 0.1.0"
+languages = ["gdshader"]
+extensions = ["gdshader", "gdshaderinc"]
+language_ids = { gdshader = "gdshader", gdshaderinc = "gdshaderinc" }
+readiness = "immediate"
+diagnostics_owner = true
+send_root_path = true
+env = { PATH = "/usr/local/bin:/usr/bin:/bin" }
+
+# --- Salesforce / Apex: apex-jorje-lsp.jar (forcedotcom
+# salesforcedx-vscode main; README apex route) via wrapper
+# (jar has no --version; pin = jar sha256 prefix, see wrapper).
+# first-response: JVM + jorje warm-up.
+[[server]]
+id = "apex-language-server"
+binary = "/home/phaedrus/.local/share/theodolite/bin/apex-lsp"
+version_probe = ["--version"]
+expect_version = "apex-jorje-lsp 2549c3ff3bba"
+languages = ["apex"]
+extensions = ["cls", "trigger"]
+language_ids = { cls = "apex", trigger = "apex" }
+readiness = "first-response"
+diagnostics_owner = true
+env = { PATH = "/usr/local/bin:/usr/bin:/bin" }
+
+# --- Salesforce / LWC: @salesforce/lwc-language-server 4.12.13
+# (npm user prefix) via wrapper (no --version; needs --stdio).
+# Diver lwc_ls. Serves the JS/HTML of LWC bundles; addressed by
+# server name (the "js" extension is shared with the TypeScript
+# stanza — unnamed routing of .js stays with the first claimant,
+# per the bridge's ambiguity rule callers name this server for
+# LWC work). diagnostics_owner = false.
+[[server]]
+id = "lwc-language-server"
+binary = "/home/phaedrus/.local/share/theodolite/bin/lwc-lsp"
+version_probe = ["--version"]
+expect_version = "lwc-language-server 4.12.13"
+languages = ["lwc"]
+extensions = ["js", "html"]
+language_ids = { js = "javascript", html = "html" }
+readiness = "immediate"
+diagnostics_owner = false
+env = { PATH = "/home/phaedrus/.local/bin:/usr/local/bin:/usr/bin:/bin" }
+
+# --- Salesforce / SOQL: @salesforce/soql-language-server 1.1.0
+# (npm user prefix) via wrapper (package ships no bin; wrapper
+# runs lib/server.js under node --stdio). Diver soql_ls.
+[[server]]
+id = "soql-language-server"
+binary = "/home/phaedrus/.local/share/theodolite/bin/soql-lsp"
+version_probe = ["--version"]
+expect_version = "soql-language-server 1.1.0"
+languages = ["soql"]
+extensions = ["soql", "sosl"]
+language_ids = { soql = "soql", sosl = "soql" }
+readiness = "immediate"
+diagnostics_owner = true
+env = { PATH = "/usr/local/bin:/usr/bin:/bin" }
+
+# --- Salesforce / AgentScript: busbar-sf-agentscript-lsp (cargo
+# install; README Salesforce route — the README's npm names
+# @agentscript/lsp-server and @salesforce/agentscript-language-
+# server both 404 on the registry, probed 2026-11-24) via wrapper
+# (binary prints nothing for --version; pin = binary sha256
+# prefix, see wrapper). Diver agentscript_ls.
+[[server]]
+id = "agentscript-language-server"
+binary = "/home/phaedrus/.local/share/theodolite/bin/agentscript-lsp"
+version_probe = ["--version"]
+expect_version = "busbar-sf-agentscript-lsp 7d6369d24ce4"
+languages = ["agentscript"]
+extensions = ["agent"]
+language_ids = { agent = "agentscript" }
+readiness = "immediate"
+diagnostics_owner = true
+env = { PATH = "/home/phaedrus/.cargo/bin:/usr/local/bin:/usr/bin:/bin" }
+
+# --- Tier-2 / C-C++: clangd 23.1.5 (Arch package). Diver
+# clangd_ls. Consumer: engine/native work, GDExtension, native RE.
+[[server]]
+id = "clangd"
+binary = "/usr/bin/clangd"
+version_probe = ["--version"]
+expect_version = '''clangd version 23.1.5
+Features: linux
+Platform: x86_64-pc-linux-gnu'''
+languages = ["cpp"]
+extensions = ["c", "h", "cpp", "cxx", "cc", "hpp", "hh", "hxx"]
+language_ids = { c = "c", h = "cpp", cpp = "cpp", cxx = "cpp", cc = "cpp", hpp = "cpp", hh = "cpp", hxx = "cpp" }
+readiness = "immediate"
+diagnostics_owner = true
+env = { PATH = "/usr/local/bin:/usr/bin:/bin" }
+
+# --- Tier-2 / YAML: yaml-language-server 1.24.0 (Arch package)
+# via wrapper (needs --stdio). Diver yaml_ls.
+[[server]]
+id = "yaml-language-server"
+binary = "/home/phaedrus/.local/share/theodolite/bin/yaml-lsp"
+version_probe = ["--version"]
+expect_version = "1.24.0"
+languages = ["yaml"]
+extensions = ["yml", "yaml"]
+language_ids = { yml = "yaml", yaml = "yaml" }
+readiness = "immediate"
+diagnostics_owner = true
+env = { PATH = "/usr/local/bin:/usr/bin:/bin" }
+
+# --- Tier-2 / Bash: bash-language-server 5.6.0 (Arch package)
+# via wrapper (serves via `start`). Diver bash_ls.
+[[server]]
+id = "bash-language-server"
+binary = "/home/phaedrus/.local/share/theodolite/bin/bash-lsp"
+version_probe = ["--version"]
+expect_version = "5.6.0"
+languages = ["bash"]
+extensions = ["sh", "bash"]
+language_ids = { sh = "shellscript", bash = "shellscript" }
+readiness = "immediate"
+diagnostics_owner = true
+env = { PATH = "/home/phaedrus/.local/bin:/usr/local/bin:/usr/bin:/bin" }
