@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 1.0.2 - 2026-11-26
 
 - **GDShader route: legacy `rootPath` opt-in.** gdshader-lsp
   0.1.0 reads its project root only from the deprecated
