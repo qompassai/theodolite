@@ -27,3 +27,7 @@ tokio = { version = "1", features = ["io-std", "io-util", "macros", "rt-multi-th
 
 [profile.release]
 debug = false
+
+[[bench]]
+name = "hot_paths"
+harness = false
