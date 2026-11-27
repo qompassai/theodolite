@@ -1,5 +1,6 @@
 # theodolite
 
+mcp-name: ai.qompass/theodolite
 A headless, deterministic LSP bridge MCP server (IDEA-0092,
 `ai.qompass/theodolite`): pinned language-server sessions exposed
 as bounded read tools for editor-free contexts — primo workers,

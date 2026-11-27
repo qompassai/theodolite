@@ -1,5 +1,10 @@
 # Changelog
 
+## 1.0.3 - 2026-11-26
+
+- Patch: add the MCP Registry ownership marker (`mcp-name: ai.qompass/theodolite`) to the README as shipped in the crate package; the 1.0.2 crates.io README lacked it and the Registry rejected the publish. No functional changes.
+
+
 ## 1.0.2 - 2026-11-26
 
 - **GDShader route: legacy `rootPath` opt-in.** gdshader-lsp
