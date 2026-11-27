@@ -3,7 +3,7 @@
   "name": "ai.qompass/theodolite",
   "title": "Theodolite",
   "description": "Headless LSP bridge MCP server: pinned language-server sessions as bounded read tools.",
-  "version": "1.0.3",
+  "version": "1.1.0",
   "websiteUrl": "https://qompass.ai/solutions/theodolite/",
   "repository": {
     "url": "https://github.com/qompassai/theodolite",
@@ -13,7 +13,7 @@
     {
       "registryType": "cargo",
       "identifier": "theodolite",
-      "version": "1.0.3",
+      "version": "1.1.0",
       "transport": {
         "type": "stdio"
       }
@@ -34,7 +34,7 @@
         "orcid": "https://orcid.org/0000-0002-0302-4812",
         "zenodoCommunity": "https://zenodo.org/communities/qompassai"
       },
-      "versionNote": "1.0.3: patch release - adds the MCP Registry ownership marker (mcp-name) to the packaged README; no functional changes from 1.0.2."
+      "versionNote": "1.1.0: minor release - checker v1 lands: [[checker]] config kind with the glslangValidator Vulkan cross-check profile (Decision 23)."
     }
   }
 }

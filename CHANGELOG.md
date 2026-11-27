@@ -1,5 +1,28 @@
 # Changelog
 
+## 1.1.0 - 2026-11-27
+
+- **Checker v1: `[[checker]]` config kind (Decision 23).** A new
+  stanza class beside `[[server]]`: one-shot external checker
+  tools whose diagnostics cross-check the owning LSP server
+  without displacing it. First profile:
+  `glslang-validator-1` — the system `glslangValidator` run
+  against Vulkan 1.3 (`authority = "cross-check"`), invoked
+  explicitly through the existing `diagnostics` tool by naming
+  the checker id; `session_status` on a checker id reports the
+  run-record family (last run per document, version transcript,
+  config hash) and no fabricated LSP state. Every other tool
+  refuses a checker id with a typed error. Config is validated
+  at load (unknown fields denied, version pin is an exact
+  full-string match, per-stanza input/output/diagnostic bounds),
+  runs are bounded (timeout, debounce, per-run temp dirs), and
+  the parser has a golden corpus plus an adversarial fake-checker
+  test family. Design: theodolite-coverage-20261124
+  CHECKER-DESIGN.md. Gates: full suite 144/144 over three
+  consecutive runs, clippy `-D warnings` clean, fmt clean; the
+  live bridge with the restored stanza answers the checker path
+  end-to-end (clean 0, planted GLSL error caught, restored 0).
+
 ## 1.0.3 - 2026-11-26
 
 - Patch: add the MCP Registry ownership marker (`mcp-name: ai.qompass/theodolite`) to the README as shipped in the crate package; the 1.0.2 crates.io README lacked it and the Registry rejected the publish. No functional changes.
