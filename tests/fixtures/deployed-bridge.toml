@@ -694,6 +694,31 @@ env = { PATH = "/usr/local/bin:/usr/bin:/bin" }
 
 # --- Tier-2 / YAML: yaml-language-server 1.24.0 (Arch package)
 # via wrapper (needs --stdio). Diver yaml_ls.
+# --- CUDA: clangd 23.1.5, second stanza in CUDA mode
+# (next-10 set 8, 2026-11-28). The C/C++ clangd stanza above is
+# untouched; this one claims cu/cuh (no other claimant, so it
+# owns their diagnostics). Toolkit discovery is project config,
+# not stanza material: clangd's driver needs the compile flag
+# --cuda-path, supplied per project via .clangd
+# (CompileFlags: Add: [--cuda-path=/opt/cuda]); primo's toolkit
+# is /opt/cuda (CUDA 13.0, CUDARC_CUDA_VERSION=13040). Without
+# it, .cu files report drv_no_cuda_installation -- the gate
+# workspace carries the .clangd that proves the full route.
+[[server]]
+id = "clangd-cuda"
+binary = "/usr/bin/clangd"
+version_probe = ["--version"]
+expect_version = """
+clangd version 23.1.5
+Features: linux
+Platform: x86_64-pc-linux-gnu"""
+languages = ["cuda"]
+extensions = ["cu", "cuh"]
+language_ids = { cu = "cuda", cuh = "cuda" }
+readiness = "immediate"
+diagnostics_owner = true
+env = { PATH = "/usr/local/bin:/usr/bin:/bin" }
+
 [[server]]
 id = "yaml-language-server"
 binary = "/home/phaedrus/.local/share/theodolite/bin/yaml-lsp"
