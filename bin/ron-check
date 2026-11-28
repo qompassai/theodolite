@@ -1,0 +1,14 @@
+#!/bin/sh
+# Theodolite checker wrapper for ron-check (next-10 set 11,
+# 2026-11-28). The probe binary -- built from
+# tools/ron-check-probe in this repo on the ron crate (=0.12.3),
+# installed at ~/.local/share/theodolite/ron-check/ron-check-probe
+# -- implements the bridge's glslang checker argv contract itself;
+# this wrapper answers the version probe in the composed shape
+# (wrapper line + the probe's ron pin line) and execs the probe
+# for check invocations.
+if [ "$1" = "--version" ]; then
+  echo "ron-check 1.0.0"
+  exec /home/phaedrus/.local/share/theodolite/ron-check/ron-check-probe --version
+fi
+exec /home/phaedrus/.local/share/theodolite/ron-check/ron-check-probe "$@"

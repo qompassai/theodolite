@@ -1260,3 +1260,35 @@ language_ids = { xml = "xml", xsd = "xml" }
 readiness = "immediate"
 diagnostics_owner = true
 env = { PATH = "/usr/local/bin:/usr/bin:/bin" }
+
+# --- RON syntax: ron-check (checker, next-10 set 11, 2026-11-28).
+# Tool = bin/ron-check, a wrapper over the ron-check-probe binary
+# (built from tools/ron-check-probe in this repo on the ron crate
+# =0.12.3 -- the parser Rust consumers of .ron data use, so its
+# verdicts are ground truth by construction). ron-lsp owns .ron
+# diagnostics but publishes 0 on syntax errors (re-probe sweep,
+# 2026-11-28: diagnostics hollow for syntax errors); this checker
+# supplies the missing syntax signal. authority = "cross-check":
+# ron-lsp keeps the ownership flag, so this checker is reachable
+# by explicit id only (the statix-check precedent). Version pin =
+# the wrapper's own line plus the probe's ron pin line.
+[[checker]]
+id = "ron-check"
+parser = "glslang-validator-1"
+binary = "/home/phaedrus/.local/share/theodolite/bin/ron-check"
+version_probe = ["--version"]
+expect_version = "ron-check 1.0.0\nron 0.12.3"
+languages = ["ron"]
+extensions = ["ron"]
+language_ids = { ron = "ron" }
+stage_by_extension = { ron = "frag" }
+authority = "cross-check"
+trigger = "on-sync"
+debounce_ms = 250
+timeout_ms = 15000
+max_input_bytes = 4194304
+max_output_bytes = 1048576
+max_diagnostics = 512
+root_markers = [".git"]
+command = ["/home/phaedrus/.local/share/theodolite/bin/ron-check", "-V", "--target-env", "vulkan1.3", "--error-column", "--stdin", "-S", "{stage}", "-I{file_dir}", "-I{project_root}", "--depfile", "{depfile}", "-o", "{output}", "{path}"]
+env = { PATH = "/usr/local/bin:/usr/bin:/bin" }

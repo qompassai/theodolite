@@ -1,0 +1,16 @@
+[package]
+name = "ron-check-probe"
+version = "1.0.0"
+edition = "2021"
+description = "Theodolite checker probe: RON syntax diagnostics from the ron crate parser, in the bridge's glslang info-log grammar."
+license = "Apache-2.0"
+
+[dependencies]
+ron = "=0.12.3"
+
+[profile.release]
+debug = false
+
+# Standalone leaf crate inside the theodolite repo tree: its own
+# workspace root, so the parent package never absorbs it.
+[workspace]
