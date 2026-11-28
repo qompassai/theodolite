@@ -1000,3 +1000,37 @@ max_diagnostics = 512
 root_markers = [".git", "flake.nix"]
 command = ["/home/phaedrus/.local/share/theodolite/bin/deadnix-check", "-V", "--target-env", "vulkan1.3", "--error-column", "--stdin", "-S", "{stage}", "-I{file_dir}", "-I{project_root}", "--depfile", "{depfile}", "-o", "{output}", "{path}"]
 env = { PATH = "/usr/local/bin:/usr/bin:/bin" }
+
+# --- Lua: luacheck as a cross-check checker (next-10 set 2,
+# 2026-11-28). LuaLS keeps diagnostics ownership; this checker
+# exists for the scope-analysis class LuaLS is blind to -- the
+# AGENTS.md alphabetization hazard (2026-10-06): an
+# earlier-defined local function calling a later-defined one
+# silently becomes a global lookup, and only luacheck's scope
+# analysis flags the signature pair (W113 accessing undefined
+# variable X + W211 unused function X). The wrapper discovers
+# .luacheckrc by walking up from the real file's directory and
+# passes it via --config (Diver's live rc is the reference:
+# vim global, ignore list); path-keyed files[...] overrides do
+# not match the bridge's temp path and so do not apply on this
+# route -- recorded in the wrapper header.
+[[checker]]
+id = "luacheck-check"
+parser = "glslang-validator-1"
+binary = "/home/phaedrus/.local/share/theodolite/bin/luacheck-check"
+version_probe = ["--version"]
+expect_version = "luacheck-check 1.0.0\nLuacheck: 1.2.0"
+languages = ["lua"]
+extensions = ["lua"]
+language_ids = { lua = "lua" }
+stage_by_extension = { lua = "frag" }
+authority = "cross-check"
+trigger = "on-sync"
+debounce_ms = 250
+timeout_ms = 15000
+max_input_bytes = 4194304
+max_output_bytes = 1048576
+max_diagnostics = 512
+root_markers = [".luacheckrc", ".git"]
+command = ["/home/phaedrus/.local/share/theodolite/bin/luacheck-check", "-V", "--target-env", "vulkan1.3", "--error-column", "--stdin", "-S", "{stage}", "-I{file_dir}", "-I{project_root}", "--depfile", "{depfile}", "-o", "{output}", "{path}", "{file_dir}"]
+env = { PATH = "/usr/local/bin:/usr/bin:/bin" }
