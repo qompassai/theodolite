@@ -1081,3 +1081,59 @@ max_diagnostics = 512
 root_markers = ["pyproject.toml", "ruff.toml", ".git"]
 command = ["/home/phaedrus/.local/share/theodolite/bin/ruff-check", "-V", "--target-env", "vulkan1.3", "--error-column", "--stdin", "-S", "{stage}", "-I{file_dir}", "-I{project_root}", "--depfile", "{depfile}", "-o", "{output}", "{path}", "{file_dir}"]
 env = { PATH = "/usr/local/bin:/usr/bin:/bin" }
+
+# --- CMake lint: cmakelint as a cross-check checker (next-10
+# set 5, 2026-11-28). neocmakelsp holds diagnostics ownership
+# for cmake/txt, but its diagnostics control is FAIL (zero on
+# every seeded defect, see its stanza comment) -- this checker
+# is the working CMake lint signal, reachable by explicit id.
+# Claims txt as well so CMakeLists.txt is routable, mirroring
+# the server stanza's routing note. Promotion to owner (with
+# neocmakelsp's flag flipped) is a named follow-up decision in
+# the programme EXECUTION.md, not taken here.
+[[checker]]
+id = "cmakelint-check"
+parser = "glslang-validator-1"
+binary = "/home/phaedrus/.local/share/theodolite/bin/cmakelint-check"
+version_probe = ["--version"]
+expect_version = "cmakelint-check 1.0.0\ncmakelint 1.4.3"
+languages = ["cmake"]
+extensions = ["cmake", "txt"]
+language_ids = { cmake = "cmake", txt = "cmake" }
+stage_by_extension = { cmake = "frag", txt = "frag" }
+authority = "cross-check"
+trigger = "on-sync"
+debounce_ms = 250
+timeout_ms = 15000
+max_input_bytes = 4194304
+max_output_bytes = 1048576
+max_diagnostics = 512
+root_markers = [".git"]
+command = ["/home/phaedrus/.local/share/theodolite/bin/cmakelint-check", "-V", "--target-env", "vulkan1.3", "--error-column", "--stdin", "-S", "{stage}", "-I{file_dir}", "-I{project_root}", "--depfile", "{depfile}", "-o", "{output}", "{path}"]
+env = { PATH = "/usr/local/bin:/usr/bin:/bin" }
+
+# --- Makefile lint: checkmake as a cross-check checker
+# (next-10 set 5, 2026-11-28). autotools-language-server owns
+# mk/make diagnostics; checkmake runs by explicit id. The
+# bridge routes by extension, so an extensionless Makefile is
+# not routable; *.mk / *.make files are.
+[[checker]]
+id = "checkmake-check"
+parser = "glslang-validator-1"
+binary = "/home/phaedrus/.local/share/theodolite/bin/checkmake-check"
+version_probe = ["--version"]
+expect_version = "checkmake-check 1.0.0\ncheckmake  built at 2026-04-18T19:05:54Z by makepkg <makepkg> with go version go1.26.2-X:nodwarf5 linux/amd64"
+languages = ["make"]
+extensions = ["mk", "make"]
+language_ids = { mk = "make", make = "make" }
+stage_by_extension = { mk = "frag", make = "frag" }
+authority = "cross-check"
+trigger = "on-sync"
+debounce_ms = 250
+timeout_ms = 15000
+max_input_bytes = 4194304
+max_output_bytes = 1048576
+max_diagnostics = 512
+root_markers = [".git"]
+command = ["/home/phaedrus/.local/share/theodolite/bin/checkmake-check", "-V", "--target-env", "vulkan1.3", "--error-column", "--stdin", "-S", "{stage}", "-I{file_dir}", "-I{project_root}", "--depfile", "{depfile}", "-o", "{output}", "{path}"]
+env = { PATH = "/usr/local/bin:/usr/bin:/bin" }
