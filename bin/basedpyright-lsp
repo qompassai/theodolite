@@ -1,0 +1,8 @@
+#!/bin/sh
+# basedpyright-lsp -- theodolite wrapper for basedpyright-langserver.
+# The langserver has no --version exit path (any invocation starts
+# the server and demands a transport flag), so the probe is answered
+# here from the basedpyright CLI's version output, and the server is
+# exec'd with --stdio.
+if [ "$1" = "--version" ]; then exec /usr/bin/basedpyright --version; fi
+exec /usr/bin/basedpyright-langserver --stdio

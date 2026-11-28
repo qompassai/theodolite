@@ -1,0 +1,104 @@
+#!/usr/bin/env python3
+"""ruff-check 1.0.0 -- theodolite checker wrapper (glslang profile).
+
+Runs ruff (estate Python linter) over the target and translates its
+JSON output into the bridge's glslang info-log grammar. Severity:
+ruff's `invalid-syntax` and E9xx codes are ERROR, everything else
+WARNING. Config: a ruff.toml or pyproject.toml discovered walking
+up from the real file's directory ({file_dir}) is passed via
+--config; without one, ruff's defaults apply. ruff exit codes:
+0 clean, 1 findings, 2 tool error (fails loud here, never a
+silent zero).
+"""
+import json
+import os
+import subprocess
+import sys
+
+VERSION = "ruff-check 1.0.0"
+RUFF = "/usr/bin/ruff"
+
+
+def fail_loud(detail):
+    sys.stdout.write("ruff-check: unparseable ruff output: %s\n" % detail)
+    return 1
+
+
+def find_config(start_dir):
+    d = os.path.abspath(start_dir)
+    while True:
+        for name in ("ruff.toml", "pyproject.toml"):
+            cand = os.path.join(d, name)
+            if os.path.isfile(cand):
+                return cand
+        parent = os.path.dirname(d)
+        if parent == d:
+            return None
+        d = parent
+
+
+def main(argv):
+    if argv and argv[0] == "--version":
+        out = subprocess.run([RUFF, "--version"], capture_output=True,
+                             text=True).stdout.splitlines()
+        print(VERSION)
+        print(out[0].strip() if out else "ruff unknown")
+        return 0
+
+    args = argv[1:] if argv and argv[0] == "--" else argv
+    try:
+        out_idx = args.index("-o") if "-o" in args else args.index("--output")
+        output_path = args[out_idx + 1]
+        dep_idx = args.index("--depfile")
+        depfile_path = args[dep_idx + 1]
+        target = args[-2]
+        file_dir = args[-1]
+    except (ValueError, IndexError):
+        return fail_loud("argv shape")
+
+    with open(depfile_path, "w", encoding="utf-8") as f:
+        f.write("%s: %s\n" % (output_path, target))
+    with open(output_path, "w", encoding="utf-8"):
+        pass
+
+    cmd = [RUFF, "check", "--output-format", "json", "--no-cache"]
+    cfg = find_config(file_dir)
+    if cfg:
+        cmd += ["--config", cfg]
+    cmd.append(target)
+    proc = subprocess.run(cmd, capture_output=True, text=True)
+    if proc.returncode not in (0, 1):
+        return fail_loud("ruff exit %d: %s" % (proc.returncode,
+                                               proc.stderr.strip()[:200]))
+    try:
+        findings = json.loads(proc.stdout or "[]")
+    except ValueError:
+        return fail_loud(proc.stdout[:200])
+
+    diags = []
+    for f in findings:
+        loc = f.get("location") or {}
+        line_no = int(loc.get("row", 1))
+        col = int(loc.get("column", 1))
+        code = f.get("code") or "invalid-syntax"
+        msg = f.get("message", "")
+        sev = "ERROR" if code == "invalid-syntax" or code.startswith("E9") else "WARNING"
+        diags.append((line_no, col, sev, "%s %s" % (code, msg)))
+    diags.sort(key=lambda d: (d[0], d[1]))
+
+    err = sys.stderr
+    err.write("stdin\n")
+    n_err = 0
+    for line_no, col, sev, msg in diags:
+        if sev == "ERROR":
+            n_err += 1
+        err.write("%s: stdin:%d:%d: %s\n" % (sev, line_no, col, msg))
+    if n_err:
+        err.write("ERROR: %d compilation errors. No code generated.\n" % n_err)
+        sys.stdout.write("SPIR-V is not generated for failed compile or link\n")
+        return 2
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

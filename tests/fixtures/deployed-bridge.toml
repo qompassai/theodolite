@@ -199,6 +199,28 @@ env = { PATH = "/usr/local/bin:/usr/bin:/bin" }
 # --- TypeScript/JavaScript: typescript-language-server 6.0.0 via
 # wrapper (needs --stdio). SPEC SS4.11 found no live consumer; the
 # stanza makes the route available per the Owner's order.
+# --- Python (typed): basedpyright 1.40.2 via probe wrapper
+# (next-10 set 3, 2026-11-28). By-name typed route alongside
+# jedi: jedi KEEPS diagnostics ownership at landing
+# (diagnostics_owner = false); promotion is a separate named
+# decision after a soak on real estate Python, recorded in the
+# programme EXECUTION.md. The wrapper answers --version from
+# the basedpyright CLI (the langserver has no version exit
+# path) and execs the langserver with --stdio.
+[[server]]
+id = "basedpyright"
+binary = "/home/phaedrus/.local/share/theodolite/bin/basedpyright-lsp"
+version_probe = ["--version"]
+expect_version = """
+basedpyright 1.40.2
+based on pyright 1.1.414"""
+languages = ["python"]
+extensions = ["py"]
+language_ids = { py = "python" }
+readiness = "immediate"
+diagnostics_owner = false
+env = { PATH = "/usr/local/bin:/usr/bin:/bin" }
+
 [[server]]
 id = "typescript-language-server"
 binary = "/home/phaedrus/.local/share/theodolite/bin/ts-lsp"
@@ -1033,4 +1055,29 @@ max_output_bytes = 1048576
 max_diagnostics = 512
 root_markers = [".luacheckrc", ".git"]
 command = ["/home/phaedrus/.local/share/theodolite/bin/luacheck-check", "-V", "--target-env", "vulkan1.3", "--error-column", "--stdin", "-S", "{stage}", "-I{file_dir}", "-I{project_root}", "--depfile", "{depfile}", "-o", "{output}", "{path}", "{file_dir}"]
+env = { PATH = "/usr/local/bin:/usr/bin:/bin" }
+
+# --- Python: ruff as a cross-check checker (next-10 set 3,
+# 2026-11-28). jedi owns .py diagnostics; ruff runs by explicit
+# id. The wrapper discovers ruff.toml / pyproject.toml walking
+# up from the real file's directory and passes it via --config.
+[[checker]]
+id = "ruff-check"
+parser = "glslang-validator-1"
+binary = "/home/phaedrus/.local/share/theodolite/bin/ruff-check"
+version_probe = ["--version"]
+expect_version = "ruff-check 1.0.0\nruff 0.17.6"
+languages = ["python"]
+extensions = ["py"]
+language_ids = { py = "python" }
+stage_by_extension = { py = "frag" }
+authority = "cross-check"
+trigger = "on-sync"
+debounce_ms = 250
+timeout_ms = 15000
+max_input_bytes = 4194304
+max_output_bytes = 1048576
+max_diagnostics = 512
+root_markers = ["pyproject.toml", "ruff.toml", ".git"]
+command = ["/home/phaedrus/.local/share/theodolite/bin/ruff-check", "-V", "--target-env", "vulkan1.3", "--error-column", "--stdin", "-S", "{stage}", "-I{file_dir}", "-I{project_root}", "--depfile", "{depfile}", "-o", "{output}", "{path}", "{file_dir}"]
 env = { PATH = "/usr/local/bin:/usr/bin:/bin" }

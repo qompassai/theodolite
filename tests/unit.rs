@@ -868,18 +868,19 @@ fn checker_bound_and_marker_violations_are_rejected() {
 }
 
 /// The acceptance gate from the gdshader coordination update: the
-/// CURRENT deployed bridge.toml shape — 39 server stanzas and the
-/// 5 checker stanzas, with `send_root_path = true` on gdshader-lsp
+/// CURRENT deployed bridge.toml shape — 40 server stanzas and the
+/// 6 checker stanzas, with `send_root_path = true` on gdshader-lsp
 /// and apex-language-server — must load. (Shape re-pinned at the
 /// batch-5 repo sync, 2026-11-28; re-pinned again at next-10 set 1
 /// the same day: +nixd server, +statix-check/+deadnix-check
-/// checkers, nil binary path repaired; and at set 2:
-/// +luacheck-check checker.)
+/// checkers, nil binary path repaired; at set 2:
+/// +luacheck-check checker; and at set 3: +basedpyright
+/// server, +ruff-check checker.)
 #[test]
 fn deployed_bridge_toml_shape_loads() {
     let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/deployed-bridge.toml");
     let config = Config::load(&path).expect("deployed bridge.toml shape loads");
-    assert_eq!(config.servers.len(), 39);
+    assert_eq!(config.servers.len(), 40);
     let checker_ids: Vec<&str> = config.checkers.iter().map(|c| c.id.as_str()).collect();
     assert_eq!(
         checker_ids,
@@ -889,6 +890,7 @@ fn deployed_bridge_toml_shape_loads() {
             "statix-check",
             "deadnix-check",
             "luacheck-check",
+            "ruff-check",
         ]
     );
     let gdshader = config
