@@ -1,0 +1,84 @@
+#!/usr/bin/env python3
+"""actionlint-check 1.0.0 -- theodolite checker wrapper (glslang profile).
+
+Runs actionlint (-format json) over GitHub Actions workflow files
+and translates findings into the bridge's glslang info-log grammar.
+All actionlint findings are ERROR (a flagged workflow is broken).
+
+Path scope (by design, not a silent zero): actionlint's rules only
+mean anything for files under .github/workflows/. The bridge routes
+by extension (yml/yaml), so this wrapper checks the real file's
+directory ({file_dir}): outside a workflows directory it is a
+documented no-op and emits no diagnostics. Inside one, unparseable
+actionlint output or an unexpected exit fails loud.
+"""
+import json
+import os
+import subprocess
+import sys
+
+VERSION = "actionlint-check 1.0.0"
+ACTIONLINT = "/usr/bin/actionlint"
+
+
+def fail_loud(detail):
+    sys.stdout.write("actionlint-check: unparseable output: %s\n" % detail)
+    return 1
+
+
+def main(argv):
+    if argv and argv[0] == "--version":
+        out = subprocess.run([ACTIONLINT, "--version"], capture_output=True,
+                             text=True).stdout.splitlines()
+        print(VERSION)
+        print(out[0].strip() if out else "actionlint unknown")
+        return 0
+
+    args = argv[1:] if argv and argv[0] == "--" else argv
+    try:
+        out_idx = args.index("-o") if "-o" in args else args.index("--output")
+        output_path = args[out_idx + 1]
+        dep_idx = args.index("--depfile")
+        depfile_path = args[dep_idx + 1]
+        target = args[-2]
+        file_dir = args[-1]
+    except (ValueError, IndexError):
+        return fail_loud("argv shape")
+
+    with open(depfile_path, "w", encoding="utf-8") as f:
+        f.write("%s: %s\n" % (output_path, target))
+    with open(output_path, "w", encoding="utf-8"):
+        pass
+
+    err = sys.stderr
+    err.write("stdin\n")
+    norm = os.path.normpath(file_dir)
+    if not norm.endswith(os.path.join(".github", "workflows")):
+        return 0  # out of scope by design (see header)
+
+    proc = subprocess.run([ACTIONLINT, "-format", "{{json .}}", target],
+                          capture_output=True, text=True)
+    if proc.returncode not in (0, 1):
+        return fail_loud("actionlint exit %d: %s" % (proc.returncode,
+                                                     proc.stderr.strip()[:200]))
+    try:
+        findings = json.loads(proc.stdout or "[]")
+    except ValueError:
+        return fail_loud(proc.stdout[:200])
+
+    diags = []
+    for f in findings:
+        diags.append((int(f.get("line", 1)), int(f.get("column", 1)),
+                      "ERROR", "%s %s" % (f.get("kind", ""), f.get("message", ""))))
+    diags.sort(key=lambda d: (d[0], d[1]))
+    for line_no, col, sev, msg in diags:
+        err.write("%s: stdin:%d:%d: %s\n" % (sev, line_no, col, msg))
+    if diags:
+        err.write("ERROR: %d compilation errors. No code generated.\n" % len(diags))
+        sys.stdout.write("SPIR-V is not generated for failed compile or link\n")
+        return 2
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

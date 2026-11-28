@@ -1137,3 +1137,30 @@ max_diagnostics = 512
 root_markers = [".git"]
 command = ["/home/phaedrus/.local/share/theodolite/bin/checkmake-check", "-V", "--target-env", "vulkan1.3", "--error-column", "--stdin", "-S", "{stage}", "-I{file_dir}", "-I{project_root}", "--depfile", "{depfile}", "-o", "{output}", "{path}"]
 env = { PATH = "/usr/local/bin:/usr/bin:/bin" }
+
+# --- GitHub Actions: actionlint as a cross-check checker
+# (next-10 set 6, 2026-11-28). The YAML server keeps yml/yaml
+# ownership; actionlint runs by explicit id. The wrapper is
+# path-scoped: it only lints files whose real directory is
+# .github/workflows (a documented no-op elsewhere) because
+# actionlint's rules are meaningless for general YAML.
+[[checker]]
+id = "actionlint-check"
+parser = "glslang-validator-1"
+binary = "/home/phaedrus/.local/share/theodolite/bin/actionlint-check"
+version_probe = ["--version"]
+expect_version = "actionlint-check 1.0.0\n1.7.12"
+languages = ["yaml"]
+extensions = ["yml", "yaml"]
+language_ids = { yml = "yaml", yaml = "yaml" }
+stage_by_extension = { yml = "frag", yaml = "frag" }
+authority = "cross-check"
+trigger = "on-sync"
+debounce_ms = 250
+timeout_ms = 15000
+max_input_bytes = 4194304
+max_output_bytes = 1048576
+max_diagnostics = 512
+root_markers = [".git"]
+command = ["/home/phaedrus/.local/share/theodolite/bin/actionlint-check", "-V", "--target-env", "vulkan1.3", "--error-column", "--stdin", "-S", "{stage}", "-I{file_dir}", "-I{project_root}", "--depfile", "{depfile}", "-o", "{output}", "{path}", "{file_dir}"]
+env = { PATH = "/usr/local/bin:/usr/bin:/bin" }
