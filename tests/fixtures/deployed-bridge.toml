@@ -193,19 +193,20 @@ languages = ["python"]
 extensions = ["py"]
 language_ids = { py = "python" }
 readiness = "immediate"
-diagnostics_owner = true
+diagnostics_owner = false
 env = { PATH = "/usr/local/bin:/usr/bin:/bin" }
 
 # --- TypeScript/JavaScript: typescript-language-server 6.0.0 via
 # wrapper (needs --stdio). SPEC SS4.11 found no live consumer; the
 # stanza makes the route available per the Owner's order.
 # --- Python (typed): basedpyright 1.40.2 via probe wrapper
-# (next-10 set 3, 2026-11-28). By-name typed route alongside
-# jedi: jedi KEEPS diagnostics ownership at landing
-# (diagnostics_owner = false); promotion is a separate named
-# decision after a soak on real estate Python, recorded in the
-# programme EXECUTION.md. The wrapper answers --version from
-# the basedpyright CLI (the langserver has no version exit
+# (next-10 set 3, 2026-11-28). Landed as by-name typed route
+# alongside jedi with diagnostics_owner = false; PROMOTED to
+# Python diagnostics owner by Owner ruling 2026-11-28 08:47 PT
+# on set 3's planted contrast (basedpyright 4, jedi 0) -- jedi
+# keeps its language features, basedpyright owns .py gate
+# diagnostics. The wrapper answers --version from the
+# basedpyright CLI (the langserver has no version exit
 # path) and execs the langserver with --stdio.
 [[server]]
 id = "basedpyright"
@@ -218,7 +219,7 @@ languages = ["python"]
 extensions = ["py"]
 language_ids = { py = "python" }
 readiness = "immediate"
-diagnostics_owner = false
+diagnostics_owner = true
 env = { PATH = "/usr/local/bin:/usr/bin:/bin" }
 
 [[server]]
@@ -1083,7 +1084,8 @@ command = ["/home/phaedrus/.local/share/theodolite/bin/luacheck-check", "-V", "-
 env = { PATH = "/usr/local/bin:/usr/bin:/bin" }
 
 # --- Python: ruff as a cross-check checker (next-10 set 3,
-# 2026-11-28). jedi owns .py diagnostics; ruff runs by explicit
+# 2026-11-28). basedpyright owns .py diagnostics (promoted
+# 2026-11-28); ruff runs by explicit
 # id. The wrapper discovers ruff.toml / pyproject.toml walking
 # up from the real file's directory and passes it via --config.
 [[checker]]
