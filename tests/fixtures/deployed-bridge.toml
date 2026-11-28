@@ -1238,3 +1238,25 @@ language_ids = { svelte = "svelte" }
 readiness = "immediate"
 diagnostics_owner = true
 env = { PATH = "/usr/local/bin:/usr/bin:/bin" }
+
+# --- XML: lemminx 0.31.2 via probe wrapper (next-10 set 10,
+# 2026-11-28). Sole claimant for xml/xsd; owns diagnostics.
+# Schema association (the Salesforce-metadata use: *.xml
+# metadata files validated against XSDs) is per-project config,
+# not stanza material -- lemminx takes xml.fileAssociations via
+# initializationOptions settings, proven raw and through a
+# gate-local bridge config in the set-10 gate (programme
+# record). Salesforce does not publish official metadata XSDs,
+# so association targets are estate-authored schemas carried by
+# each Salesforce project.
+[[server]]
+id = "lemminx"
+binary = "/home/phaedrus/.local/share/theodolite/bin/lemminx-lsp"
+version_probe = ["--version"]
+expect_version = "lemminx 0.31.2"
+languages = ["xml"]
+extensions = ["xml", "xsd"]
+language_ids = { xml = "xml", xsd = "xml" }
+readiness = "immediate"
+diagnostics_owner = true
+env = { PATH = "/usr/local/bin:/usr/bin:/bin" }

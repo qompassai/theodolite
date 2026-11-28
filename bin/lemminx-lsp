@@ -1,0 +1,8 @@
+#!/bin/sh
+# Theodolite bridge wrapper for lemminx 0.31.2 (Arch package
+# lemminx 0.31.2-2). The binary has no --version exit path (any
+# invocation starts the server), so the probe is answered here
+# from the package version (pacman -Q lemminx, probed
+# 2026-11-28) and the server is exec'd bare on stdio.
+if [ "$1" = "--version" ]; then echo "lemminx 0.31.2"; exit 0; fi
+exec /usr/bin/lemminx
