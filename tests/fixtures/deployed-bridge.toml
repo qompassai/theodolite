@@ -661,19 +661,21 @@ readiness = "immediate"
 diagnostics_owner = true
 env = { PATH = "/home/phaedrus/.local/bin:/usr/local/bin:/usr/bin:/bin" }
 
-# --- Slint: slint-lsp 1.14.1 (cargo install, ~/.cargo/bin; the
-# version of record for torogao-mobile, whose Cargo.lock pins
-# slint 1.14.1). Stdio LSP, no argv needed (upstream: "no arguments
-# are required"), so no wrapper. Added 2026-11-26 (Owner commission:
-# theodolite support for the Slint tooling). Probed same day:
-# --version prints exactly "slint-lsp 1.14.1"; initialize advertises
-# codeActionProvider=true and executeCommandProvider commands
-# slint/populate + slint/showPreview.
+# --- Slint: slint-lsp 1.19.1 (cargo install, ~/.cargo/bin).
+# PIN LAW (2026-11-28, next-10 set 4): this pin FOLLOWS the estate
+# Slint pin (Decision 6, 2026-11-27: Slint 1.19.1 everywhere;
+# torogao's Cargo.lock of record) -- when the estate pin bumps,
+# this route must re-pin and re-probe in the same act, or it
+# certifies against superseded language rules. Originally added
+# 2026-11-26 at 1.14.1 (torogao-mobile's then-pin); re-pinned to
+# 1.19.1 on 2026-11-28. Stdio LSP, no argv needed (upstream: "no
+# arguments are required"), so no wrapper. Probed 2026-11-28:
+# --version prints exactly "slint-lsp 1.19.1".
 [[server]]
 id = "slint-lsp"
 binary = "/home/phaedrus/.cargo/bin/slint-lsp"
 version_probe = ["--version"]
-expect_version = "slint-lsp 1.14.1"
+expect_version = "slint-lsp 1.19.1"
 languages = ["slint"]
 extensions = ["slint"]
 language_ids = { slint = "slint" }
