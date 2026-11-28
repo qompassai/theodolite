@@ -868,19 +868,25 @@ fn checker_bound_and_marker_violations_are_rejected() {
 }
 
 /// The acceptance gate from the gdshader coordination update: the
-/// CURRENT deployed bridge.toml shape — 32 stanzas including the
-/// gdshader stanza with `send_root_path = true` — must load.
+/// CURRENT deployed bridge.toml shape — 38 server stanzas and the
+/// 2 checker stanzas, with `send_root_path = true` on gdshader-lsp
+/// and apex-language-server — must load. (Shape re-pinned at the
+/// batch-5 repo sync, 2026-11-28.)
 #[test]
 fn deployed_bridge_toml_shape_loads() {
     let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/deployed-bridge.toml");
     let config = Config::load(&path).expect("deployed bridge.toml shape loads");
-    assert_eq!(config.servers.len(), 32);
-    assert!(config.checkers.is_empty());
+    assert_eq!(config.servers.len(), 38);
+    let checker_ids: Vec<&str> = config.checkers.iter().map(|c| c.id.as_str()).collect();
+    assert_eq!(
+        checker_ids,
+        ["glslang-vulkan-crosscheck", "shaderlab-hlsl-check"]
+    );
     let gdshader = config
         .server_by_id("gdshader-lsp")
         .expect("gdshader stanza present");
     assert!(gdshader.send_root_path);
-    assert!(config.servers.iter().filter(|s| s.send_root_path).count() == 1);
+    assert_eq!(config.servers.iter().filter(|s| s.send_root_path).count(), 2);
 }
 
 // --- Checker parser goldens (design §9.1.2/9.1.4, §9.2.4, §9.2.6) ---

@@ -438,7 +438,14 @@ extensions = ["mojo"]
 language_ids = { mojo = "mojo" }
 readiness = "immediate"
 diagnostics_owner = true
-env = { PATH = "/home/phaedrus/.pixi/envs/mojo/bin:/usr/local/bin:/usr/bin:/bin" }
+# env cure (batch 5, 2026-11-27): the raw pixi driver binaries do
+# not self-locate the stdlib; Modular's own pip entry point sets
+# these four MODULAR_* vars before exec'ing the driver (mojo/run.py
+# _sdk_default_env, conda case in _package_root.py). Without them
+# the server reports "'std' is required" / "unable to locate module
+# 'std'" on every valid file. IMPORT_PATH alone is insufficient
+# (the driver then cannot locate the CompilerRT library).
+env = { PATH = "/home/phaedrus/.pixi/envs/mojo/bin:/usr/local/bin:/usr/bin:/bin", MODULAR_MAX_PACKAGE_ROOT = "/home/phaedrus/.pixi/envs/mojo", MODULAR_MOJO_MAX_PACKAGE_ROOT = "/home/phaedrus/.pixi/envs/mojo", MODULAR_MOJO_MAX_DRIVER_PATH = "/home/phaedrus/.pixi/envs/mojo/bin/mojo", MODULAR_MOJO_MAX_IMPORT_PATH = "/home/phaedrus/.pixi/envs/mojo/lib/mojo" }
 
 # --- Make: autotools-language-server 0.1.3 (uv tool install,
 # ~/.local/bin). Diver's Make entry (autotoo_ls). ROUTING NOTE:
@@ -467,6 +474,16 @@ env = { PATH = "/home/phaedrus/.local/bin:/usr/local/bin:/usr/bin:/bin" }
 # no diagnostics handler at all); slangd is the working HLSL
 # diagnostics route. This stanza keeps the ShaderLab surface
 # (hover/completion/signature help). See SHADER-ADDENDUM.md.
+# 2026-11-27 batch-5 ShaderLab cure: diagnostics_owner corrected
+# true -> false below (the HTML-class correction, batch 4). The
+# owner claim was never earnable: this server has no diagnostics
+# implementation, and no_publish_means_empty_ms turned that into
+# a structural 0 -- a planted HLSL error read 0 through the live
+# bridge on the pre-cure config (baseline reproduced in
+# theodolite-batch5-20261127/SHADERLAB.md). Gate diagnostics for
+# .shader are owned by the shaderlab-hlsl-check [[checker]] at
+# the end of this file; this stanza keeps the read-class surface
+# it actually implements.
 [[server]]
 id = "shader-ls"
 binary = "/home/phaedrus/.local/share/theodolite/bin/shader-lsp"
@@ -476,7 +493,7 @@ languages = ["shaderlab"]
 extensions = ["shader", "cg"]
 language_ids = { shader = "shaderlab", cg = "cg" }
 readiness = "immediate"
-diagnostics_owner = true
+diagnostics_owner = false
 no_publish_means_empty_ms = 5000
 env = { PATH = "/home/phaedrus/.local/share/dotnet-sdk:/usr/local/bin:/usr/bin:/bin" }
 
@@ -526,6 +543,15 @@ env = { PATH = "/usr/local/bin:/usr/bin:/bin" }
 # salesforcedx-vscode main; README apex route) via wrapper
 # (jar has no --version; pin = jar sha256 prefix, see wrapper).
 # first-response: JVM + jorje warm-up.
+# send_root_path = true (batch-5 cure, 2026-11-27): jorje resolves
+# its workspace root from the legacy rootPath param ONLY; without
+# it the server answers initialize but never indexes or analyzes
+# (zero publishes, bridge reads hang) -- the GDShader class of
+# failure. Proven standalone: bridge-shaped params + rootPath
+# publish in ~2 s; without, silence. The wrapper carries the VS
+# Code extension's launch properties; -Ddebug.semantic.errors=true
+# is load-bearing for type diagnostics (without it, type errors
+# publish as an empty set).
 [[server]]
 id = "apex-language-server"
 binary = "/home/phaedrus/.local/share/theodolite/bin/apex-lsp"
@@ -534,6 +560,7 @@ expect_version = "apex-jorje-lsp 2549c3ff3bba"
 languages = ["apex"]
 extensions = ["cls", "trigger"]
 language_ids = { cls = "apex", trigger = "apex" }
+send_root_path = true
 readiness = "first-response"
 diagnostics_owner = true
 env = { PATH = "/usr/local/bin:/usr/bin:/bin" }
@@ -633,3 +660,246 @@ language_ids = { sh = "shellscript", bash = "shellscript" }
 readiness = "immediate"
 diagnostics_owner = true
 env = { PATH = "/home/phaedrus/.local/bin:/usr/local/bin:/usr/bin:/bin" }
+
+# --- Slint: slint-lsp 1.14.1 (cargo install, ~/.cargo/bin; the
+# version of record for torogao-mobile, whose Cargo.lock pins
+# slint 1.14.1). Stdio LSP, no argv needed (upstream: "no arguments
+# are required"), so no wrapper. Added 2026-11-26 (Owner commission:
+# theodolite support for the Slint tooling). Probed same day:
+# --version prints exactly "slint-lsp 1.14.1"; initialize advertises
+# codeActionProvider=true and executeCommandProvider commands
+# slint/populate + slint/showPreview.
+[[server]]
+id = "slint-lsp"
+binary = "/home/phaedrus/.cargo/bin/slint-lsp"
+version_probe = ["--version"]
+expect_version = "slint-lsp 1.14.1"
+languages = ["slint"]
+extensions = ["slint"]
+language_ids = { slint = "slint" }
+readiness = "immediate"
+diagnostics_owner = true
+env = { PATH = "/home/phaedrus/.cargo/bin:/usr/local/bin:/usr/bin:/bin" }
+
+# =====================================================================
+# Batch 4 — 2026-11-27 (Owner ruling 2026-11-27 08:34 PT adopting
+# the next-batch proposal, ~/workspace/theodolite-next-batch-20261127/
+# PROPOSAL.md). Go, Astro, HTML, AWK. Every expect_version probed on
+# primo on 2026-11-27; every route below was run under the cured
+# protocol (sacrificial first query, planted-error control, clean
+# control, fresh-file restore trigger) before being called done —
+# verdicts in ~/workspace/theodolite-batch4-20261127/RECORD.md.
+# =====================================================================
+
+# --- Go: gopls v0.24.0 (Arch package, /usr/bin; the reference Go
+# server). Rose is Go (920 .go files) and had no route until now.
+# The bin answers its  subcommand with exactly the probe
+# string below (probed 2026-11-27; gopls has no --version flag —
+#  exits 2, measured in the first probe run);
+# stdio, no argv, no wrapper.
+# first-response readiness: gopls loads the module workspace
+# before its first diagnostics publish. Stanza env sets PATH only;
+# GOPATH/GOCACHE stay at primo's defaults (~/go, ~/.cache/go-build
+# — both home fs, warm from rose builds), which satisfies the
+# proposal's home-fs intent without forcing a cold module cache.
+[[server]]
+id = "gopls"
+binary = "/usr/bin/gopls"
+version_probe = ["version"]
+expect_version = "golang.org/x/tools/gopls v0.24.0"
+languages = ["go"]
+extensions = ["go"]
+language_ids = { go = "go" }
+readiness = "first-response"
+diagnostics_owner = true
+env = { PATH = "/usr/local/bin:/usr/bin:/bin" }
+
+# --- Astro: @astrojs/language-server 2.16.12 (npm global) via
+# wrapper (bridge spawns binary bare; astro-ls needs --stdio).
+# The wrapper delegates --version to the real bin, which prints
+# exactly "2.16.12" (probed 2026-11-27). first-response readiness:
+# the server embeds a TypeScript server and warms up slowly.
+[[server]]
+id = "astro-language-server"
+binary = "/home/phaedrus/.local/share/theodolite/bin/astro-lsp"
+version_probe = ["--version"]
+expect_version = "2.16.12"
+languages = ["astro"]
+extensions = ["astro"]
+language_ids = { astro = "astro" }
+readiness = "first-response"
+diagnostics_owner = true
+# The server refuses initialize without typescript.tsdk (measured
+# in the first probe run: error -32603). The Diver astro config
+# resolves it dynamically (workspace node_modules, then npm global
+# root); the bridge stanza is static, so it pins the npm-global
+# TypeScript (/usr/lib/node_modules/typescript/lib,
+# tsserverlibrary.js verified present 2026-11-27) — the same
+# endpoint the Diver chain falls back to on this machine.
+initialization_options = { typescript = { tsdk = "/usr/lib/node_modules/typescript/lib" } }
+env = { PATH = "/usr/local/bin:/usr/bin:/bin" }
+
+# --- HTML: vscode-html-language-server (Arch package, VS Code
+# extracted) via wrapper (no --version; needs --stdio). Diver
+# html_ls. Same package family as the PASS-ing CSS/JSON routes
+# (1.136.0). Until now .html had no diagnostics owner at all
+# (the LWC stanza claims the extension by-name with
+# diagnostics_owner = false and is untouched by this addition).
+# MEASURED 2026-11-27 (batch-4 probe): FAIL-on-diagnostics, the
+# CMake/Make/ShaderLab class. The bridge probe read 0 on a
+# planted mismatched-tag error; a standalone probe read 0 push
+# AND pull across five malformed seeds (mismatched pair, stray
+# end tag, unclosed tag, duplicate attribute, misspelled close
+# tag); the bundled vscode-html-languageservice exposes no
+# doValidation at all. diagnostics_owner therefore stays false:
+# the stanza serves the read-class tools and owns nothing it
+# cannot prove. Full evidence: the batch-4 record.
+[[server]]
+id = "vscode-html-language-server"
+binary = "/home/phaedrus/.local/share/theodolite/bin/html-lsp"
+version_probe = ["--version"]
+expect_version = "vscode-html-language-server 1.136.0"
+languages = ["html"]
+extensions = ["html"]
+language_ids = { html = "html" }
+readiness = "immediate"
+diagnostics_owner = false
+env = { PATH = "/usr/local/bin:/usr/bin:/bin" }
+
+# --- AWK: awk-language-server 0.10.6 (npm user prefix ~/.local,
+# installed 2026-11-27: npm install -g --prefix ~/.local
+# awk-language-server). The bin answers --version itself with
+# exactly "0.10.6" (probed 2026-11-27) and serves stdio bare.
+# (Wrapper added later — see the Wrapper note below the stanza.)
+# Install note: npm blocked the tree-sitter install
+# scripts (allow-scripts policy); the shipped prebuilds load
+# without them — verified standalone before wiring (initialize +
+# a published syntax diagnostic).
+[[server]]
+id = "awk-language-server"
+binary = "/home/phaedrus/.local/share/theodolite/bin/awk-lsp"
+version_probe = ["--version"]
+expect_version = "0.10.6"
+languages = ["awk"]
+extensions = ["awk"]
+language_ids = { awk = "awk" }
+readiness = "immediate"
+diagnostics_owner = true
+env = { PATH = "/home/phaedrus/.local/bin:/usr/local/bin:/usr/bin:/bin" }
+
+# Wrapper note (added after the first bridge probe, 2026-11-27):
+# the stock bin DIES under the bridge — its onInitialized handler
+# unconditionally awaits workspace/workspaceFolders (the bundled
+# vscode-languageserver sends it with no capability gate) and the
+# bridge's designed -32601 answer to undeclared methods is an
+# unhandled rejection that exits the process (measured: EOF,
+# exit 1, default and --noIndex alike). bin/awk-lsp is a
+# byte-forwarding proxy that intercepts only that one request and
+# answers it with the workspaceFolders from the bridge's own
+# initialize params; everything else, applyEdit included, passes
+# through untouched. --version delegates to the real bin.
+
+# --- Protobuf: protols 0.13.1 (Arch package, /usr/bin; dedicated
+# proto3 language server, stdio, spawned bare, no wrapper). Wired
+# 2026-11-27 (theodolite batch 5) for the route-5 pilot proto tree
+# (package rose.core.v1) — the estate's first .proto body of code.
+# expect_version is the FULL two-line probe output (bridge law:
+# exact full-string match): line 2 is protols' fallback-include-path
+# state on this host (no protoc WKT include directory found). If
+# that state ever changes, the pin fails loudly as
+# ServerVersionMismatch, by design — re-probe and re-pin, never
+# trim the string to fit.
+# Diagnostics are full protoc compilation (published source
+# "protoc"): a syntax error publishes; an undefined message type
+# publishes as "\"X\" is not defined." when it is the file's only
+# defect class (a parse error masks the semantic phase — measured
+# standalone and through the bridge, batch-5 record). Import
+# resolution: protols resolves imports when the session is rooted
+# at the module root (for route-5, route5/proto/) or when the root
+# carries a protols.toml with [config] include_paths naming the
+# module dir; rooted elsewhere, unresolved imports publish
+# "failed to find proto file" on the import line — honest noise,
+# not a silent zero.
+[[server]]
+id = "protols"
+binary = "/usr/bin/protols"
+version_probe = ["--version"]
+expect_version = "protols 0.13.1\nfallback include path: not set"
+languages = ["proto"]
+extensions = ["proto"]
+language_ids = { proto = "proto" }
+readiness = "immediate"
+diagnostics_owner = true
+env = { PATH = "/usr/local/bin:/usr/bin:/bin" }
+
+# --- GLSL cross-check: glslangValidator (system) as a 
+# stanza, authority = "cross-check" (checker v1, deployed
+# 2026-11-24). glsld remains the GLSL diagnostics owner; this
+# stanza runs only when a caller names its id explicitly.
+# Design: theodolite-coverage-20261124/CHECKER-DESIGN.md 2.1.
+[[checker]]
+id = "glslang-vulkan-crosscheck"
+parser = "glslang-validator-1"
+binary = "/usr/bin/glslangValidator"
+version_probe = ["--version"]
+expect_version = "Glslang Version: 11:16.6.0\nESSL Version: OpenGL ES GLSL 3.20 glslang Khronos. 16.6.0\nGLSL Version: 4.60 glslang Khronos. 16.6.0\nSPIR-V Version 0x00010600, Revision 1\nGLSL.std.450 Version 100, Revision 1\nKhronos Tool ID 8\nSPIR-V Generator Version 11\nGL_KHR_vulkan_glsl version 100\nARB_GL_gl_spirv version 100"
+languages = ["glsl"]
+extensions = ["frag", "vert", "geom", "comp", "tesc", "tese", "glsl"]
+language_ids = { frag = "glsl", vert = "glsl", geom = "glsl", comp = "glsl", tesc = "glsl", tese = "glsl", glsl = "glsl" }
+stage_by_extension = { frag = "frag", vert = "vert", geom = "geom", comp = "comp", tesc = "tesc", tese = "tese" }
+authority = "cross-check"
+trigger = "on-sync"
+debounce_ms = 250
+timeout_ms = 15000
+max_input_bytes = 4194304
+max_output_bytes = 1048576
+max_diagnostics = 512
+root_markers = [".git", "shaders.toml"]
+command = ["/usr/bin/glslangValidator", "-V", "--target-env", "vulkan1.3", "--error-column", "--stdin", "-S", "{stage}", "-I{file_dir}", "-I{project_root}", "--depfile", "{depfile}", "-o", "{output}"]
+env = { PATH = "/usr/local/bin:/usr/bin:/bin" }
+
+# --- ShaderLab: shaderlab-hlsl-check (checker, deployed
+# 2026-11-27, batch-5 ShaderLab cure). Tool =
+# bin/shaderlab-check, a wrapper implementing the glslang
+# checker profile's argv contract for .shader files: it parses
+# ShaderLab structure narrowly (program-block pairing + brace
+# balance outside program blocks), extracts each program block's
+# #pragma entry points, prepends HLSLINCLUDE/CGINCLUDE contents,
+# and compiles every entry with the real toolchain --
+# glslangValidator in HLSL mode (-D --hlsl-dx9-compatible, the
+# mode that accepts the Cg-era legacy surface) with the file's
+# directory, the project root, and the newest Unity editor's
+# CGIncludes on the include path. Diagnostics are mapped back
+# to .shader lines (unit lines are verbatim file lines, so
+# columns carry exactly) and emitted in the glslang info-log
+# grammar this profile parses; the version pin below is the
+# wrapper's own line plus glslangValidator's full --version.
+# Boundaries, all fail-loud or labelled, none silent: surface
+# shaders (#pragma surface) are not compiled (Unity codegen) --
+# the wrapper emits a WARNING at the pragma line saying the
+# body is unverified; a diagnostic raised inside a Unity
+# CGIncludes file (outside any workspace) invalidates the run
+# as CheckerOutputInvalid rather than reading as a zero;
+# semantic HLSL errors carry glslang's own recovery diagnostics
+# after the first, exact, one (measured in SHADERLAB.md).
+# Record: theodolite-batch5-20261127/SHADERLAB.md.
+[[checker]]
+id = "shaderlab-hlsl-check"
+parser = "glslang-validator-1"
+binary = "/home/phaedrus/.local/share/theodolite/bin/shaderlab-check"
+version_probe = ["--version"]
+expect_version = "shaderlab-check 1.0.0\nGlslang Version: 11:16.6.0\nESSL Version: OpenGL ES GLSL 3.20 glslang Khronos. 16.6.0\nGLSL Version: 4.60 glslang Khronos. 16.6.0\nSPIR-V Version 0x00010600, Revision 1\nGLSL.std.450 Version 100, Revision 1\nKhronos Tool ID 8\nSPIR-V Generator Version 11\nGL_KHR_vulkan_glsl version 100\nARB_GL_gl_spirv version 100"
+languages = ["shaderlab"]
+extensions = ["shader"]
+language_ids = { shader = "shaderlab" }
+stage_by_extension = { shader = "frag" }
+authority = "owner"
+trigger = "on-sync"
+debounce_ms = 250
+timeout_ms = 60000
+max_input_bytes = 4194304
+max_output_bytes = 1048576
+max_diagnostics = 512
+root_markers = [".git", "Assets", "ProjectSettings"]
+command = ["/home/phaedrus/.local/share/theodolite/bin/shaderlab-check", "-V", "--target-env", "vulkan1.3", "--error-column", "--stdin", "-S", "{stage}", "-I{file_dir}", "-I{project_root}", "--depfile", "{depfile}", "-o", "{output}"]
+env = { PATH = "/usr/local/bin:/usr/bin:/bin" }

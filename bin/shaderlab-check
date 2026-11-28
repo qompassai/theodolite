@@ -1,0 +1,411 @@
+#!/usr/bin/python3
+"""shaderlab-check 1.0.0 — theodolite checker tool for Unity ShaderLab.
+
+Invoked by the bridge as the `shaderlab-hlsl-check` [[checker]]
+(binary == command[0]). The bridge feeds the .shader file's exact
+bytes on stdin with the glslang-profile argv shape
+(-V --target-env ... --error-column --stdin -S <stage>
+-I<file_dir> -I<project_root> --depfile <p> -o <p>); this wrapper
+implements that contract for ShaderLab:
+
+  1. A narrow ShaderLab structure parse (line-based): program-block
+     pairing (HLSLPROGRAM/CGPROGRAM/HLSLINCLUDE/CGINCLUDE vs
+     ENDHLSL/ENDCG) and brace balance outside program blocks.
+     Structure defects are reported as positioned diagnostics and
+     suppress compilation (extraction would be unreliable).
+  2. Each program block's entry points (from its #pragma
+     vertex/fragment/kernel/geometry/hull/domain lines) are compiled
+     with the real toolchain — /usr/bin/glslangValidator in HLSL
+     mode (-D --hlsl-dx9-compatible, the mode that accepts the
+     Cg-era legacy surface Unity shaders use) — with the file's own
+     directory, the project root, and the newest installed Unity
+     editor's CGIncludes on the include path. HLSLINCLUDE/CGINCLUDE
+     block contents are prepended to every program block, as Unity
+     does. Diagnostics are mapped back to .shader file lines (unit
+     lines are verbatim file lines, so columns carry over exactly)
+     and re-emitted in the bridge's glslang info-log grammar:
+     framing line `stdin`, positioned ERROR:/WARNING: lines, and a
+     recounted aggregate. glslang's non-diagnostic summary line
+     ("<file>(<n>): error at column ..., HLSL parsing failed.") is
+     dropped, as is its aggregate (recounted here); link WARNINGs
+     (the entry-point-not-found shape) are re-emitted positioned at
+     the #pragma line that named the entry.
+  3. Surface-shader blocks (#pragma surface) are NOT compiled —
+     Unity generates their code; the checker says so with a WARNING
+     at the pragma line instead of staying silent.
+
+Exit codes follow the bridge grammar: 0 = no error diagnostics,
+2 = compile failure (>= 1 positioned error), 3 = link failure only.
+A depfile naming the run's resolved project-local #include files is
+written to the --depfile path so the bridge cache can invalidate.
+"""
+import glob
+import os
+import re
+import subprocess
+import sys
+import tempfile
+
+GLSLANG = "/usr/bin/glslangValidator"
+WRAPPER_VERSION = "shaderlab-check 1.0.0"
+
+BLOCK_OPEN = {"HLSLPROGRAM", "CGPROGRAM", "HLSLINCLUDE", "CGINCLUDE"}
+BLOCK_CLOSE = {"ENDHLSL", "ENDCG"}
+INCLUDE_BLOCKS = {"HLSLINCLUDE", "CGINCLUDE"}
+STAGE_BY_PRAGMA = {
+    "vertex": "vert",
+    "fragment": "frag",
+    "kernel": "comp",
+    "geometry": "geom",
+    "hull": "tesc",
+    "domain": "tese",
+}
+PRAGMA_ENTRY_RE = re.compile(
+    r"^\s*#pragma\s+(vertex|fragment|kernel|geometry|hull|domain)\s+([A-Za-z_]\w*)"
+)
+PRAGMA_SURFACE_RE = re.compile(r"^\s*#pragma\s+surface\b")
+INCLUDE_RE = re.compile(r'^\s*#include\s+"([^"]+)"')
+POSITIONED_RE = re.compile(r"^(ERROR|WARNING): (.+):(\d+):(\d+): (.*)$")
+LINK_RE = re.compile(r"^(ERROR|WARNING): Linking (\w+(?: \w+)?) stage: (.*)$")
+
+
+def version_output():
+    out = subprocess.run(
+        [GLSLANG, "--version"], capture_output=True, text=True, timeout=15
+    )
+    return WRAPPER_VERSION + "\n" + out.stdout.strip()
+
+
+def strip_line(line, state):
+    """Strip // and /* */ comments and "..." strings from one line.
+
+    `state` carries block-comment state across lines. Returns the
+    stripped text (positions are NOT preserved; used only for
+    structure counting and directive detection)."""
+    res = []
+    i = 0
+    in_block = state["block_comment"]
+    while i < len(line):
+        if in_block:
+            end = line.find("*/", i)
+            if end == -1:
+                i = len(line)
+            else:
+                in_block = False
+                i = end + 2
+            continue
+        if line.startswith("//", i):
+            break
+        if line.startswith("/*", i):
+            in_block = True
+            i += 2
+            continue
+        if line[i] == '"':
+            end = line.find('"', i + 1)
+            i = len(line) if end == -1 else end + 1
+            continue
+        res.append(line[i])
+        i += 1
+    state["block_comment"] = in_block
+    return "".join(res)
+
+
+class Diag:
+    def __init__(self, severity, token, line, col, message):
+        self.severity = severity  # "ERROR" | "WARNING"
+        self.token = token
+        self.line = line
+        self.col = col
+        self.message = message
+
+    def key(self):
+        return (self.severity, self.token, self.line, self.col, self.message)
+
+
+def parse_structure(lines):
+    """Line-based ShaderLab structure parse.
+
+    Returns (blocks, structure_diags). A block is a dict with
+    kind ('program'|'include'), open_line, and content = list of
+    (file_line, original_text)."""
+    blocks = []
+    diags = []
+    state = {"block_comment": False}
+    brace_stack = []  # (line, col) of unmatched '{' outside blocks
+    current = None
+    for lineno, raw in enumerate(lines, start=1):
+        stripped = strip_line(raw, state).strip()
+        if current is not None:
+            if stripped in BLOCK_CLOSE:
+                current["close_line"] = lineno
+                blocks.append(current)
+                current = None
+            elif stripped in BLOCK_OPEN:
+                diags.append(Diag("ERROR", "stdin", lineno, 1,
+                                  "ShaderLab structure: '%s' opens a program block "
+                                  "inside the block opened at line %d"
+                                  % (stripped, current["open_line"])))
+            else:
+                current["content"].append((lineno, raw))
+            continue
+        if stripped in BLOCK_OPEN:
+            current = {
+                "kind": "include" if stripped in INCLUDE_BLOCKS else "program",
+                "open_line": lineno,
+                "directive": stripped,
+                "content": [],
+            }
+            continue
+        if stripped in BLOCK_CLOSE:
+            diags.append(Diag("ERROR", "stdin", lineno, 1,
+                              "ShaderLab structure: '%s' without a matching "
+                              "program block" % stripped))
+            continue
+        # Brace balance outside program blocks (ShaderLab skeleton),
+        # over the comment/string-stripped text computed above.
+        for ch in stripped:
+            if ch == "{":
+                brace_stack.append(lineno)
+            elif ch == "}":
+                if brace_stack:
+                    brace_stack.pop()
+                else:
+                    diags.append(Diag("ERROR", "stdin", lineno, 1,
+                                      "ShaderLab structure: '}' without a "
+                                      "matching '{'"))
+    if current is not None:
+        diags.append(Diag("ERROR", "stdin", current["open_line"], 1,
+                          "ShaderLab structure: '%s' block opened here is "
+                          "never closed (no ENDHLSL/ENDCG)"
+                          % current["directive"]))
+    if brace_stack:
+        diags.append(Diag("ERROR", "stdin", brace_stack[0], 1,
+                          "ShaderLab structure: '{' opened here is never "
+                          "closed"))
+    return blocks, diags
+
+
+def find_cgincludes():
+    home = os.environ.get("HOME", "")
+    pattern = os.path.join(
+        home, "Unity/Hub/Editor/*/Editor/Data/Resources/CGIncludes/UnityCG.cginc"
+    )
+    hits = sorted(glob.glob(pattern))
+    if not hits:
+        return None
+    return os.path.dirname(hits[-1])
+
+
+def compile_unit(unit_lines, stage, entry, include_dirs, tmpdir):
+    """Compile one unit with glslangValidator (HLSL mode).
+
+    unit_lines: list of (file_line, text). Returns (diags, unknown_lines)
+    with diags already translated to .shader coordinates."""
+    unit_path = os.path.join(tmpdir, "unit.%s.hlsl" % stage)
+    line_map = {}
+    with open(unit_path, "w", encoding="utf-8") as f:
+        for idx, (file_line, text) in enumerate(unit_lines, start=1):
+            line_map[idx] = file_line
+            f.write(text + "\n")
+    argv = [GLSLANG, "-D", "-V", "--hlsl-dx9-compatible", "--error-column",
+            "-e", entry]
+    for d in include_dirs:
+        argv.append("-I" + d)
+    argv += [unit_path, "-o", os.path.join(tmpdir, "unit.spv")]
+    proc = subprocess.run(argv, capture_output=True, text=True, timeout=110)
+    diags = []
+    unknown = []
+    for line in proc.stderr.splitlines():
+        if not line.strip():
+            continue
+        if line.strip() == unit_path:
+            continue  # framing line
+        m = LINK_RE.match(line)
+        if m:
+            sev, stage_name, msg = m.groups()
+            if sev == "ERROR":
+                diags.append(Diag("ERROR", "__LINK__", 0, 0,
+                                  "Linking %s stage: %s" % (stage_name, msg)))
+            # WARNING link lines are handled by the caller (entry
+            # point case) via return-code-independent inspection;
+            # record as a link warning marker.
+            else:
+                diags.append(Diag("WARNING", "__LINK__", 0, 0,
+                                  "Linking %s stage: %s" % (stage_name, msg)))
+            continue
+        m = POSITIONED_RE.match(line)
+        if m:
+            sev, token, lno, col, msg = m.groups()
+            lno = int(lno)
+            col = int(col)
+            if token == unit_path:
+                file_line = line_map.get(lno)
+                if file_line is None:
+                    unknown.append(line)
+                    continue
+                diags.append(Diag(sev, "stdin", file_line, col, msg))
+            else:
+                # A real included file's own coordinates.
+                diags.append(Diag(sev, token, lno, col, msg))
+            continue
+        if re.match(r"^.*\(\d+\): error at column \d+, HLSL parsing failed\.$", line):
+            continue  # glslang summary line, not a diagnostic
+        if re.match(r"^ERROR: \d+ compilation errors?\.  No code generated\.$", line):
+            continue  # aggregate; recounted by the wrapper
+        if line.startswith("SPIR-V is not generated"):
+            continue
+        unknown.append(line)
+    return diags, unknown, proc.returncode
+
+
+def main():
+    args = sys.argv[1:]
+    if args and args[0] == "--version":
+        print(version_output())
+        return 0
+
+    include_dirs = []
+    depfile = None
+    output_path = None
+    i = 0
+    while i < len(args):
+        a = args[i]
+        if a.startswith("-I") and len(a) > 2:
+            include_dirs.append(a[2:])
+        elif a == "--depfile" and i + 1 < len(args):
+            i += 1
+            depfile = args[i]
+        elif a == "-o" and i + 1 < len(args):
+            i += 1
+            output_path = args[i]
+        i += 1
+
+    data = sys.stdin.buffer.read()
+    text = data.decode("utf-8")
+    lines = text.split("\n")
+    # A trailing newline yields a phantom final empty line; drop it
+    # so line counts match the file's real lines.
+    if lines and lines[-1] == "":
+        lines.pop()
+
+    blocks, diags = parse_structure(lines)
+    link_diags = []
+    exit_code = 0
+
+    if not diags:
+        cginc = find_cgincludes()
+        compile_include_dirs = list(include_dirs)
+        if cginc:
+            compile_include_dirs.append(cginc)
+        include_units = []
+        for b in blocks:
+            if b["kind"] == "include":
+                include_units.extend(b["content"])
+        seen = set()
+        for b in blocks:
+            if b["kind"] != "program":
+                continue
+            entries = []
+            surface_line = None
+            for (lno, raw) in b["content"]:
+                m = PRAGMA_ENTRY_RE.match(raw)
+                if m:
+                    entries.append((STAGE_BY_PRAGMA[m.group(1)], m.group(2), lno, raw))
+                if PRAGMA_SURFACE_RE.match(raw):
+                    surface_line = lno
+            if surface_line is not None and not entries:
+                diags.append(Diag(
+                    "WARNING", "stdin", surface_line, 1,
+                    "ShaderLab: surface-shader block is not compiled by this "
+                    "checker (Unity generates its code); the block's HLSL "
+                    "body is not verified"))
+                continue
+            if not entries:
+                diags.append(Diag(
+                    "ERROR", "stdin", b["open_line"], 1,
+                    "ShaderLab: program block declares no #pragma "
+                    "vertex/fragment/kernel entry point"))
+                continue
+            unit = include_units + b["content"]
+            with tempfile.TemporaryDirectory(prefix="shaderlab-check-") as tmpdir:
+                for (stage, entry, pragma_line, pragma_raw) in entries:
+                    cdiags, unknown, _rc = compile_unit(
+                        unit, stage, entry, compile_include_dirs, tmpdir)
+                    if unknown:
+                        # Fail loud, in a shape the bridge refuses
+                        # (exit 1 is not a mappable checker exit).
+                        sys.stdout.write(
+                            "shaderlab-check: unparseable glslang output: %r\n"
+                            % unknown[0])
+                        return 1
+                    for d in cdiags:
+                        if d.token == "__LINK__":
+                            if d.severity == "WARNING" and "Entry point not found" in d.message:
+                                col = pragma_raw.find(entry) + 1
+                                nd = Diag("WARNING", "stdin", pragma_line,
+                                          max(col, 1),
+                                          d.message + " (entry point named "
+                                          "by this #pragma was not found)")
+                                if nd.key() not in seen:
+                                    seen.add(nd.key())
+                                    diags.append(nd)
+                            else:
+                                link_diags.append(d)
+                            continue
+                        if d.key() not in seen:
+                            seen.add(d.key())
+                            diags.append(d)
+        # Depfile: project-local files the units include directly.
+        if depfile:
+            file_dir = include_dirs[0] if include_dirs else ""
+            project_root = include_dirs[1] if len(include_dirs) > 1 else file_dir
+            deps = []
+            for (_lno, raw) in include_units + [
+                    c for b in blocks if b["kind"] == "program" for c in b["content"]]:
+                m = INCLUDE_RE.match(raw)
+                if not m:
+                    continue
+                for base in (file_dir, project_root):
+                    cand = os.path.join(base, m.group(1))
+                    if os.path.isfile(cand):
+                        cand = os.path.realpath(cand)
+                        if cand not in deps:
+                            deps.append(cand)
+                        break
+            with open(depfile, "w", encoding="utf-8") as f:
+                rest = " ".join(["stdin"] + [d.replace(" ", "\\ ") for d in deps])
+                f.write("%s: %s\n" % (output_path or "output", rest))
+
+    positioned_errors = [d for d in diags if d.severity == "ERROR"]
+    if link_diags:
+        exit_code = 3 if not positioned_errors else 2
+    elif positioned_errors:
+        exit_code = 2
+
+    out_lines = ["stdin"]
+    all_diags = diags + [d for d in link_diags if d.severity == "ERROR"]
+    all_diags.sort(key=lambda d: (d.line, d.col, d.severity))
+    for d in all_diags:
+        if d.token == "__LINK__":
+            out_lines.append("ERROR: %s" % d.message)
+        else:
+            out_lines.append("%s: %s:%d:%d: %s"
+                             % (d.severity, d.token, d.line, d.col, d.message))
+    if positioned_errors:
+        n = len(positioned_errors)
+        out_lines.append("ERROR: %d compilation error%s.  No code generated."
+                         % (n, "" if n == 1 else "s"))
+    sys.stderr.write("\n".join(out_lines) + "\n")
+    if exit_code != 0:
+        sys.stdout.write("SPIR-V is not generated for failed compile or link\n")
+    if output_path:
+        try:
+            with open(output_path, "wb") as f:
+                f.write(b"")
+        except OSError:
+            pass
+    return exit_code
+
+
+if __name__ == "__main__":
+    sys.exit(main())
