@@ -868,7 +868,7 @@ fn checker_bound_and_marker_violations_are_rejected() {
 }
 
 /// The acceptance gate from the gdshader coordination update: the
-/// CURRENT deployed bridge.toml shape — 41 server stanzas and the
+/// CURRENT deployed bridge.toml shape — 42 server stanzas and the
 /// 10 checker stanzas, with `send_root_path = true` on gdshader-lsp
 /// and apex-language-server — must load. (Shape re-pinned at the
 /// batch-5 repo sync, 2026-11-28; re-pinned again at next-10 set 1
@@ -879,12 +879,13 @@ fn checker_bound_and_marker_violations_are_rejected() {
 /// +cmakelint-check/+checkmake-check checkers;
 /// and at set 6: +actionlint-check checker;
 /// and at set 7: +vnu-check checker;
-/// and at set 8: +clangd-cuda server.)
+/// and at set 8: +clangd-cuda server;
+/// and at set 9: +svelte-language-server server.)
 #[test]
 fn deployed_bridge_toml_shape_loads() {
     let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/deployed-bridge.toml");
     let config = Config::load(&path).expect("deployed bridge.toml shape loads");
-    assert_eq!(config.servers.len(), 41);
+    assert_eq!(config.servers.len(), 42);
     let checker_ids: Vec<&str> = config.checkers.iter().map(|c| c.id.as_str()).collect();
     assert_eq!(
         checker_ids,

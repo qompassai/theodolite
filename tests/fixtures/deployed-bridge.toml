@@ -1220,3 +1220,21 @@ max_diagnostics = 512
 root_markers = [".git"]
 command = ["/home/phaedrus/.local/share/theodolite/bin/vnu-check", "-V", "--target-env", "vulkan1.3", "--error-column", "--stdin", "-S", "{stage}", "-I{file_dir}", "-I{project_root}", "--depfile", "{depfile}", "-o", "{output}", "{path}"]
 env = { PATH = "/usr/local/bin:/usr/bin:/bin" }
+
+# --- Svelte: svelte-language-server 0.18.6 via probe wrapper
+# (next-10 set 9, 2026-11-28). npm package installed into
+# ~/.local/share/theodolite/svelte-ls (no system package on
+# primo); the wrapper answers --version from the installed
+# package version and execs svelteserver --stdio. Sole claimant
+# for .svelte; owns its diagnostics.
+[[server]]
+id = "svelte-language-server"
+binary = "/home/phaedrus/.local/share/theodolite/bin/svelte-lsp"
+version_probe = ["--version"]
+expect_version = "svelte-language-server 0.18.6"
+languages = ["svelte"]
+extensions = ["svelte"]
+language_ids = { svelte = "svelte" }
+readiness = "immediate"
+diagnostics_owner = true
+env = { PATH = "/usr/local/bin:/usr/bin:/bin" }
