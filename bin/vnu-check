@@ -1,0 +1,102 @@
+#!/usr/bin/env python3
+"""vnu-check 1.0.0 -- theodolite checker wrapper (glslang profile).
+
+Runs the Nu Html Checker (vnu.jar, the W3C validator engine) over
+HTML files and translates its JSON messages into the bridge's
+glslang info-log grammar: vnu errors are ERROR, warnings/info are
+WARNING. Chosen over HTML Tidy in the next-10 set-7 bake-off
+(2026-11-28): on identical witnesses vnu graded all five defect
+classes (content-model, duplicate id, missing alt, unknown
+element, unclosed element) as errors with spec messages, while
+Tidy graded four of five as warnings in human-oriented text.
+
+The jar is the official validator/validator release artifact,
+md5-verified at install (recorded in the stanza comment).
+_JAVA_OPTIONS/_JAVA_OPTIONS-style pickup noise is cleared for
+the subprocess so stdout stays pure JSON. Unexpected exit or
+unparseable JSON fails loud.
+"""
+import json
+import os
+import subprocess
+import sys
+
+VERSION = "vnu-check 1.0.0"
+JAR = "/home/phaedrus/.local/share/theodolite/vnu/vnu.jar"
+
+
+def fail_loud(detail):
+    sys.stdout.write("vnu-check: unparseable vnu output: %s\n" % detail)
+    return 1
+
+
+def clean_env():
+    env = dict(os.environ)
+    env.pop("_JAVA_OPTIONS", None)
+    env.pop("JAVA_TOOL_OPTIONS", None)
+    return env
+
+
+def main(argv):
+    if argv and argv[0] == "--version":
+        proc = subprocess.run(["java", "-jar", JAR, "--version"],
+                              capture_output=True, text=True, env=clean_env())
+        lines = (proc.stdout + proc.stderr).splitlines()
+        ver = lines[0].strip() if lines else "vnu unknown"
+        print(VERSION)
+        print(ver)
+        return 0
+
+    args = argv[1:] if argv and argv[0] == "--" else argv
+    try:
+        out_idx = args.index("-o") if "-o" in args else args.index("--output")
+        output_path = args[out_idx + 1]
+        dep_idx = args.index("--depfile")
+        depfile_path = args[dep_idx + 1]
+        target = args[-1]
+    except (ValueError, IndexError):
+        return fail_loud("argv shape")
+
+    with open(depfile_path, "w", encoding="utf-8") as f:
+        f.write("%s: %s\n" % (output_path, target))
+    with open(output_path, "w", encoding="utf-8"):
+        pass
+
+    proc = subprocess.run(["java", "-jar", JAR, "--format", "json", target],
+                          capture_output=True, text=True, env=clean_env())
+    if proc.returncode not in (0, 1):
+        return fail_loud("vnu exit %d: %s" % (proc.returncode,
+                                              proc.stderr.strip()[:200]))
+    # vnu writes the JSON report to stderr, not stdout.
+    raw = proc.stderr or ""
+    brace = raw.find("{")
+    try:
+        report = json.loads(raw[brace:] if brace >= 0 else "{}")
+        messages = report["messages"]
+    except (ValueError, KeyError):
+        return fail_loud(raw[:200])
+
+    diags = []
+    for m in messages:
+        line_no = int(m.get("lastLine") or 1)
+        col = int(m.get("lastColumn") or 1)
+        sev = "ERROR" if m.get("type") == "error" else "WARNING"
+        diags.append((line_no, col, sev, m.get("message", "")))
+    diags.sort(key=lambda d: (d[0], d[1]))
+
+    err = sys.stderr
+    err.write("stdin\n")
+    n_err = 0
+    for line_no, col, sev, msg in diags:
+        if sev == "ERROR":
+            n_err += 1
+        err.write("%s: stdin:%d:%d: %s\n" % (sev, line_no, col, msg))
+    if n_err:
+        err.write("ERROR: %d compilation errors. No code generated.\n" % n_err)
+        sys.stdout.write("SPIR-V is not generated for failed compile or link\n")
+        return 2
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

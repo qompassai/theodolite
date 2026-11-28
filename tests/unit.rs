@@ -869,7 +869,7 @@ fn checker_bound_and_marker_violations_are_rejected() {
 
 /// The acceptance gate from the gdshader coordination update: the
 /// CURRENT deployed bridge.toml shape — 40 server stanzas and the
-/// 9 checker stanzas, with `send_root_path = true` on gdshader-lsp
+/// 10 checker stanzas, with `send_root_path = true` on gdshader-lsp
 /// and apex-language-server — must load. (Shape re-pinned at the
 /// batch-5 repo sync, 2026-11-28; re-pinned again at next-10 set 1
 /// the same day: +nixd server, +statix-check/+deadnix-check
@@ -877,7 +877,8 @@ fn checker_bound_and_marker_violations_are_rejected() {
 /// +luacheck-check checker; and at set 3: +basedpyright
 /// server, +ruff-check checker; and at set 5:
 /// +cmakelint-check/+checkmake-check checkers;
-/// and at set 6: +actionlint-check checker.)
+/// and at set 6: +actionlint-check checker;
+/// and at set 7: +vnu-check checker.)
 #[test]
 fn deployed_bridge_toml_shape_loads() {
     let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/deployed-bridge.toml");
@@ -896,6 +897,7 @@ fn deployed_bridge_toml_shape_loads() {
             "cmakelint-check",
             "checkmake-check",
             "actionlint-check",
+            "vnu-check",
         ]
     );
     let gdshader = config

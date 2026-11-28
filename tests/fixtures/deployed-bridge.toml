@@ -1164,3 +1164,34 @@ max_diagnostics = 512
 root_markers = [".git"]
 command = ["/home/phaedrus/.local/share/theodolite/bin/actionlint-check", "-V", "--target-env", "vulkan1.3", "--error-column", "--stdin", "-S", "{stage}", "-I{file_dir}", "-I{project_root}", "--depfile", "{depfile}", "-o", "{output}", "{path}", "{file_dir}"]
 env = { PATH = "/usr/local/bin:/usr/bin:/bin" }
+
+# --- HTML validation: Nu Html Checker as a cross-check checker
+# (next-10 set 7, 2026-11-28). vscode-html-language-server keeps
+# html ownership; vnu runs by explicit id. Bake-off vs HTML Tidy
+# 5.8.0 on identical witnesses: vnu graded all five defect
+# classes (content model, duplicate id, missing alt, unknown
+# element, unclosed element) as spec-worded errors in native
+# JSON; Tidy graded four of five as warnings in repair-oriented
+# text. The jar is the official validator/validator release
+# artifact (26.11.28), md5-verified at install:
+# 640a90998ef069670c9c75bea68d8c0c.
+[[checker]]
+id = "vnu-check"
+parser = "glslang-validator-1"
+binary = "/home/phaedrus/.local/share/theodolite/bin/vnu-check"
+version_probe = ["--version"]
+expect_version = "vnu-check 1.0.0\n26.11.28 (a0cdb41)"
+languages = ["html"]
+extensions = ["html", "htm"]
+language_ids = { html = "html", htm = "html" }
+stage_by_extension = { html = "frag", htm = "frag" }
+authority = "cross-check"
+trigger = "on-sync"
+debounce_ms = 250
+timeout_ms = 30000
+max_input_bytes = 4194304
+max_output_bytes = 1048576
+max_diagnostics = 512
+root_markers = [".git"]
+command = ["/home/phaedrus/.local/share/theodolite/bin/vnu-check", "-V", "--target-env", "vulkan1.3", "--error-column", "--stdin", "-S", "{stage}", "-I{file_dir}", "-I{project_root}", "--depfile", "{depfile}", "-o", "{output}", "{path}"]
+env = { PATH = "/usr/local/bin:/usr/bin:/bin" }
