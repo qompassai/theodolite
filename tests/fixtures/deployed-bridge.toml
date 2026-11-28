@@ -284,7 +284,7 @@ readiness = "first-response"
 # the wgsl-analyzer precedent above.
 [[server]]
 id = "nil"
-binary = "/usr/bin/nil"
+binary = "/home/phaedrus/.cargo/bin/nil"
 version_probe = ["--version"]
 expect_version = "nil unknown"
 languages = ["nix"]
@@ -292,6 +292,10 @@ extensions = ["nix"]
 language_ids = { nix = "nix" }
 readiness = "immediate"
 diagnostics_owner = true
+# Binary path repaired 2026-11-28 (next-10 set 1 gate):
+# /usr/bin/nil no longer exists on primo; nil lives at
+# ~/.cargo/bin/nil (probe still prints "nil unknown", so the
+# pin is unchanged). The route was dead at spawn until this fix.
 # nil publishes publishDiagnostics ONLY for non-empty sets: a
 # clean file gets no notification at all (measured 2026-11-15/16,
 # standalone and through the bridge), so the evidence-only
@@ -304,6 +308,39 @@ diagnostics_owner = true
 # evidence-only predicate.
 no_publish_means_empty_ms = 5000
 env = { PATH = "/usr/local/bin:/usr/bin:/bin" }
+
+# --- Nix, deepened (next-10 set 1, 2026-11-28): nixd 2.7.0
+# (nix-community; ~/.local/bin/nixd, a nix-store binary) serves
+# nix SEMANTICS by name alongside nil: cross-file definition,
+# references, hover, and -- with per-project provider config --
+# NixOS option definition/hover. diagnostics_owner stays FALSE:
+# nil keeps diagnostics ownership for .nix (ownership is per
+# extension and settled at load; the statix/deadnix checkers below
+# are cross-check for the same reason).
+# PROVIDER LAYER (measured 2026-11-28, gates in
+# theodolite-next10-20261128/EXECUTION.md): nixd's nixpkgs/options
+# providers are per-project configuration (initializationOptions
+# at the editor/workspace layer), NOT stanza material -- primo has
+# no NIX_PATH and no channels, so a static expr would be fiction.
+# Proven shape against a real nixosSystem flake: options provider
+# expr (builtins.getFlake "<ws>").nixosConfigurations.<name>.options
+# makes definition on services.openssh.enable land in sshd.nix,
+# agreeing with the nix eval ground truth. A standalone
+# lib.evalModules tree does NOT satisfy nixd's option lookup
+# (measured: "attrname <seg> not found in attrset"); the provider
+# wants a full system-shaped tree, which is the estate's real
+# NixOS workload shape anyway.
+[[server]]
+id = "nixd"
+binary = "/home/phaedrus/.local/bin/nixd"
+version_probe = ["--version"]
+expect_version = "nixd, version: 2.7.0"
+languages = ["nix"]
+extensions = ["nix"]
+language_ids = { nix = "nix" }
+readiness = "immediate"
+diagnostics_owner = false
+env = { PATH = "/home/phaedrus/.local/bin:/usr/local/bin:/usr/bin:/bin" }
 
 # =====================================================================
 # Coverage build-out 2026-11-24 (Owner commission + tier-2 addendum).
@@ -904,4 +941,62 @@ max_output_bytes = 1048576
 max_diagnostics = 512
 root_markers = [".git", "Assets", "ProjectSettings"]
 command = ["/home/phaedrus/.local/share/theodolite/bin/shaderlab-check", "-V", "--target-env", "vulkan1.3", "--error-column", "--stdin", "-S", "{stage}", "-I{file_dir}", "-I{project_root}", "--depfile", "{depfile}", "-o", "{output}"]
+env = { PATH = "/usr/local/bin:/usr/bin:/bin" }
+
+# --- Nix lint: statix-check (checker, next-10 set 1, 2026-11-28).
+# Tool = bin/statix-check, a wrapper implementing the glslang
+# checker profile's argv contract for .nix files: it runs
+# `statix check --format errfmt` (this primo build of statix
+# 0.5.8 has no json feature; errfmt is its machine-readable form)
+# over the stdin bytes in a temp file and re-emits findings in the
+# glslang info-log grammar. authority = "cross-check": nil owns
+# .nix diagnostics, so this checker is reachable by explicit id
+# only (the glslang cross-check precedent). Version pin = the
+# wrapper's own line plus statix's --version.
+[[checker]]
+id = "statix-check"
+parser = "glslang-validator-1"
+binary = "/home/phaedrus/.local/share/theodolite/bin/statix-check"
+version_probe = ["--version"]
+expect_version = "statix-check 1.0.0\nstatix 0.5.8"
+languages = ["nix"]
+extensions = ["nix"]
+language_ids = { nix = "nix" }
+stage_by_extension = { nix = "frag" }
+authority = "cross-check"
+trigger = "on-sync"
+debounce_ms = 250
+timeout_ms = 15000
+max_input_bytes = 4194304
+max_output_bytes = 1048576
+max_diagnostics = 512
+root_markers = [".git", "flake.nix"]
+command = ["/home/phaedrus/.local/share/theodolite/bin/statix-check", "-V", "--target-env", "vulkan1.3", "--error-column", "--stdin", "-S", "{stage}", "-I{file_dir}", "-I{project_root}", "--depfile", "{depfile}", "-o", "{output}", "{path}"]
+env = { PATH = "/usr/local/bin:/usr/bin:/bin" }
+
+# --- Nix lint: deadnix-check (checker, next-10 set 1, 2026-11-28).
+# Tool = bin/deadnix-check, same contract: runs
+# `deadnix --output-format json` over the stdin bytes in a temp
+# file; every result (unused let binding / lambda argument /
+# pattern) is re-emitted as a WARNING in the glslang grammar.
+# authority = "cross-check" (nil owns .nix diagnostics).
+[[checker]]
+id = "deadnix-check"
+parser = "glslang-validator-1"
+binary = "/home/phaedrus/.local/share/theodolite/bin/deadnix-check"
+version_probe = ["--version"]
+expect_version = "deadnix-check 1.0.0\ndeadnix 1.3.1"
+languages = ["nix"]
+extensions = ["nix"]
+language_ids = { nix = "nix" }
+stage_by_extension = { nix = "frag" }
+authority = "cross-check"
+trigger = "on-sync"
+debounce_ms = 250
+timeout_ms = 15000
+max_input_bytes = 4194304
+max_output_bytes = 1048576
+max_diagnostics = 512
+root_markers = [".git", "flake.nix"]
+command = ["/home/phaedrus/.local/share/theodolite/bin/deadnix-check", "-V", "--target-env", "vulkan1.3", "--error-column", "--stdin", "-S", "{stage}", "-I{file_dir}", "-I{project_root}", "--depfile", "{depfile}", "-o", "{output}", "{path}"]
 env = { PATH = "/usr/local/bin:/usr/bin:/bin" }

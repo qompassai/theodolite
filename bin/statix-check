@@ -1,0 +1,131 @@
+#!/usr/bin/python3
+"""statix-check 1.0.0 — theodolite checker tool for statix (Nix lint).
+
+Invoked by the bridge as the `statix-check` [[checker]] (binary ==
+command[0]). The bridge feeds the .nix file's exact bytes on stdin
+with the glslang-profile argv shape (-V --target-env ... 
+--error-column --stdin -S <stage> -I<file_dir> -I<project_root>
+--depfile <p> -o <p> <path>); this wrapper implements that contract
+for statix:
+
+  1. The stdin bytes are written to a temp file (the target's
+     basename, so statix messages name it naturally) and checked
+     with `statix check --format errfmt` — this primo build of
+     statix (0.5.8) was NOT compiled with the json feature, so
+     errfmt is the machine-readable output of record:
+     `<file>><line>:<col>:<W|E>:<code>:<message>` per finding.
+  2. Findings are re-emitted in the bridge's glslang info-log
+     grammar: framing line `stdin`, positioned ERROR:/WARNING:
+     lines (W -> WARNING, E -> ERROR) with the statix lint code
+     kept in the message, and a recounted aggregate. Unparseable
+     statix output fails loud (exit 1, a shape the bridge refuses)
+     rather than reading as a zero.
+
+Exit codes follow the bridge grammar: 0 = no error diagnostics
+(warnings may still be present), 2 = >= 1 error diagnostic.
+A depfile naming no local dependencies is written to the --depfile
+path (statix checks the single file; it resolves no includes).
+"""
+import json
+import os
+import re
+import subprocess
+import sys
+import tempfile
+
+STATIX = "/usr/bin/statix"
+WRAPPER_VERSION = "statix-check 1.0.0"
+ERRFMT_RE = re.compile(r"^(.+)>(\d+):(\d+):([WE]):(\d+):(.*)$")
+
+
+def version_output():
+    out = subprocess.run(
+        [STATIX, "--version"], capture_output=True, text=True, timeout=15
+    )
+    return WRAPPER_VERSION + "\n" + out.stdout.strip()
+
+
+def main():
+    args = sys.argv[1:]
+    if args and args[0] == "--version":
+        print(version_output())
+        return 0
+
+    depfile = None
+    output_path = None
+    target = None
+    i = 0
+    while i < len(args):
+        a = args[i]
+        if a == "--depfile" and i + 1 < len(args):
+            i += 1
+            depfile = args[i]
+        elif a == "-o" and i + 1 < len(args):
+            i += 1
+            output_path = args[i]
+        elif not a.startswith("-"):
+            target = a
+        i += 1
+
+    data = sys.stdin.buffer.read()
+    basename = os.path.basename(target) if target else "input.nix"
+    diags = []
+    with tempfile.TemporaryDirectory(prefix="statix-check-") as tmpdir:
+        tmpfile = os.path.join(tmpdir, basename)
+        with open(tmpfile, "wb") as f:
+            f.write(data)
+        proc = subprocess.run(
+            [STATIX, "check", "--format", "errfmt", tmpfile],
+            capture_output=True, text=True, timeout=110,
+        )
+    # statix rc: 0 = clean, 1 = findings. Anything else, or output
+    # we cannot parse, fails loud.
+    if proc.returncode not in (0, 1):
+        sys.stdout.write(
+            "statix-check: statix exited %d: %r\n"
+            % (proc.returncode, (proc.stderr or proc.stdout)[:200])
+        )
+        return 1
+    for line in proc.stdout.splitlines():
+        if not line.strip():
+            continue
+        m = ERRFMT_RE.match(line)
+        if not m:
+            sys.stdout.write("statix-check: unparseable statix output: %r\n" % line)
+            return 1
+        _file, lno, col, sev, code, msg = m.groups()
+        diags.append((
+            "ERROR" if sev == "E" else "WARNING",
+            int(lno), int(col),
+            "statix %s%s: %s" % (sev, code, msg),
+        ))
+
+    if depfile:
+        with open(depfile, "w", encoding="utf-8") as f:
+            f.write("%s: stdin\n" % (output_path or "output"))
+
+    errors = [d for d in diags if d[0] == "ERROR"]
+    exit_code = 2 if errors else 0
+    out_lines = ["stdin"]
+    for sev, lno, col, msg in sorted(diags, key=lambda d: (d[1], d[2], d[0])):
+        out_lines.append("%s: stdin:%d:%d: %s" % (sev, lno, col, msg))
+    if errors:
+        n = len(errors)
+        out_lines.append(
+            "ERROR: %d compilation error%s.  No code generated."
+            % (n, "" if n == 1 else "s")
+        )
+    sys.stderr.write("\n".join(out_lines) + "\n")
+    if exit_code != 0:
+        sys.stdout.write("SPIR-V is not generated for failed compile or link\n")
+    if output_path:
+        try:
+            with open(output_path, "wb") as f:
+                f.write(b"")
+        except OSError:
+            pass
+    return exit_code
+
+
+if __name__ == "__main__":
+    sys.exit(main())

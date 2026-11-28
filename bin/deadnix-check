@@ -1,0 +1,115 @@
+#!/usr/bin/python3
+"""deadnix-check 1.0.0 — theodolite checker tool for deadnix.
+
+Invoked by the bridge as the `deadnix-check` [[checker]] (binary ==
+command[0]). The bridge feeds the .nix file's exact bytes on stdin
+with the glslang-profile argv shape; this wrapper implements that
+contract for deadnix:
+
+  1. The stdin bytes are written to a temp file (the target's
+     basename) and checked with
+     `deadnix --output-format json`, whose output is a single JSON
+     object {"file": ..., "results": [{"line", "column",
+     "endColumn", "message"}]} — one entry per dead binding
+     (unused let bindings, unused lambda arguments/patterns).
+  2. Every result is a WARNING in the bridge's glslang info-log
+     grammar (deadnix findings are lint-class, never errors):
+     framing line `stdin`, positioned WARNING: lines. Unparseable
+     deadnix output fails loud (exit 1) rather than reading as a
+     zero.
+
+Exit codes follow the bridge grammar: 0 = run completed (warnings
+may be present); deadnix itself exits 0 without --fail, which is
+what the wrapper relies on. A depfile naming no local dependencies
+is written to the --depfile path (single-file check, no includes).
+"""
+import json
+import os
+import subprocess
+import sys
+import tempfile
+
+DEADNIX = "/home/phaedrus/.cargo/bin/deadnix"
+WRAPPER_VERSION = "deadnix-check 1.0.0"
+
+
+def version_output():
+    out = subprocess.run(
+        [DEADNIX, "--version"], capture_output=True, text=True, timeout=15
+    )
+    return WRAPPER_VERSION + "\n" + out.stdout.strip()
+
+
+def main():
+    args = sys.argv[1:]
+    if args and args[0] == "--version":
+        print(version_output())
+        return 0
+
+    depfile = None
+    output_path = None
+    target = None
+    i = 0
+    while i < len(args):
+        a = args[i]
+        if a == "--depfile" and i + 1 < len(args):
+            i += 1
+            depfile = args[i]
+        elif a == "-o" and i + 1 < len(args):
+            i += 1
+            output_path = args[i]
+        elif not a.startswith("-"):
+            target = a
+        i += 1
+
+    data = sys.stdin.buffer.read()
+    basename = os.path.basename(target) if target else "input.nix"
+    diags = []
+    with tempfile.TemporaryDirectory(prefix="deadnix-check-") as tmpdir:
+        tmpfile = os.path.join(tmpdir, basename)
+        with open(tmpfile, "wb") as f:
+            f.write(data)
+        proc = subprocess.run(
+            [DEADNIX, "--output-format", "json", tmpfile],
+            capture_output=True, text=True, timeout=110,
+        )
+    if proc.returncode != 0:
+        sys.stdout.write(
+            "deadnix-check: deadnix exited %d: %r\n"
+            % (proc.returncode, (proc.stderr or proc.stdout)[:200])
+        )
+        return 1
+    try:
+        parsed = json.loads(proc.stdout) if proc.stdout.strip() else {"results": []}
+        results = parsed["results"]
+    except Exception:
+        sys.stdout.write(
+            "deadnix-check: unparseable deadnix output: %r\n" % proc.stdout[:200]
+        )
+        return 1
+    for r in results:
+        diags.append((
+            "WARNING",
+            int(r["line"]), int(r["column"]),
+            "deadnix: %s" % r["message"],
+        ))
+
+    if depfile:
+        with open(depfile, "w", encoding="utf-8") as f:
+            f.write("%s: stdin\n" % (output_path or "output"))
+
+    out_lines = ["stdin"]
+    for sev, lno, col, msg in sorted(diags, key=lambda d: (d[1], d[2], d[0])):
+        out_lines.append("%s: stdin:%d:%d: %s" % (sev, lno, col, msg))
+    sys.stderr.write("\n".join(out_lines) + "\n")
+    if output_path:
+        try:
+            with open(output_path, "wb") as f:
+                f.write(b"")
+        except OSError:
+            pass
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

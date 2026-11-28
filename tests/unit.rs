@@ -868,19 +868,26 @@ fn checker_bound_and_marker_violations_are_rejected() {
 }
 
 /// The acceptance gate from the gdshader coordination update: the
-/// CURRENT deployed bridge.toml shape — 38 server stanzas and the
-/// 2 checker stanzas, with `send_root_path = true` on gdshader-lsp
+/// CURRENT deployed bridge.toml shape — 39 server stanzas and the
+/// 4 checker stanzas, with `send_root_path = true` on gdshader-lsp
 /// and apex-language-server — must load. (Shape re-pinned at the
-/// batch-5 repo sync, 2026-11-28.)
+/// batch-5 repo sync, 2026-11-28; re-pinned again at next-10 set 1
+/// the same day: +nixd server, +statix-check/+deadnix-check
+/// checkers, nil binary path repaired.)
 #[test]
 fn deployed_bridge_toml_shape_loads() {
     let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/deployed-bridge.toml");
     let config = Config::load(&path).expect("deployed bridge.toml shape loads");
-    assert_eq!(config.servers.len(), 38);
+    assert_eq!(config.servers.len(), 39);
     let checker_ids: Vec<&str> = config.checkers.iter().map(|c| c.id.as_str()).collect();
     assert_eq!(
         checker_ids,
-        ["glslang-vulkan-crosscheck", "shaderlab-hlsl-check"]
+        [
+            "glslang-vulkan-crosscheck",
+            "shaderlab-hlsl-check",
+            "statix-check",
+            "deadnix-check",
+        ]
     );
     let gdshader = config
         .server_by_id("gdshader-lsp")
