@@ -412,7 +412,7 @@ languages = ["cmake"]
 extensions = ["cmake", "txt"]
 language_ids = { cmake = "cmake", txt = "cmake" }
 readiness = "immediate"
-diagnostics_owner = true
+diagnostics_owner = false
 env = { PATH = "/usr/local/bin:/usr/bin:/bin" }
 
 # --- CSS: vscode-css-language-server (Arch package, VS Code
@@ -1109,15 +1109,15 @@ root_markers = ["pyproject.toml", "ruff.toml", ".git"]
 command = ["/home/phaedrus/.local/share/theodolite/bin/ruff-check", "-V", "--target-env", "vulkan1.3", "--error-column", "--stdin", "-S", "{stage}", "-I{file_dir}", "-I{project_root}", "--depfile", "{depfile}", "-o", "{output}", "{path}", "{file_dir}"]
 env = { PATH = "/usr/local/bin:/usr/bin:/bin" }
 
-# --- CMake lint: cmakelint as a cross-check checker (next-10
-# set 5, 2026-11-28). neocmakelsp holds diagnostics ownership
-# for cmake/txt, but its diagnostics control is FAIL (zero on
-# every seeded defect, see its stanza comment) -- this checker
-# is the working CMake lint signal, reachable by explicit id.
-# Claims txt as well so CMakeLists.txt is routable, mirroring
-# the server stanza's routing note. Promotion to owner (with
-# neocmakelsp's flag flipped) is a named follow-up decision in
-# the programme EXECUTION.md, not taken here.
+# --- CMake lint: cmakelint as a checker (next-10 set 5,
+# 2026-11-28). Landed as cross-check beside neocmakelsp, whose
+# diagnostics control is FAIL (zero on every seeded defect, see
+# its stanza comment); PROMOTED to cmake/txt diagnostics owner
+# by Owner ruling 2026-11-28 08:48 PT -- neocmakelsp's
+# diagnostics_owner flag flipped to false in the same act; it
+# keeps its symbols/hover surface. Claims txt as well so
+# CMakeLists.txt is routable, mirroring the server stanza's
+# routing note.
 [[checker]]
 id = "cmakelint-check"
 parser = "glslang-validator-1"
@@ -1128,7 +1128,7 @@ languages = ["cmake"]
 extensions = ["cmake", "txt"]
 language_ids = { cmake = "cmake", txt = "cmake" }
 stage_by_extension = { cmake = "frag", txt = "frag" }
-authority = "cross-check"
+authority = "owner"
 trigger = "on-sync"
 debounce_ms = 250
 timeout_ms = 15000
